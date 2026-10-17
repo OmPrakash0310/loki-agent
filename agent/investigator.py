@@ -13,6 +13,7 @@ Built to spend as little as possible:
 import json
 import logging
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ import anthropic
 import context
 import db
 import slack
+import telemetry as tm
 import tools
 
 log = logging.getLogger("agent")
@@ -224,7 +226,17 @@ def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing,
     return report, steps, tokens_in, tokens_out, cost
 
 
-def investigate(inv_id: int) -> None:
+def investigate(inv_id: int, model: str | None = None) -> None:
+    """model: override LOKI_MODEL for this investigation (backtests use it to run the free fake model)."""
+    with db.connect() as conn:
+        inv = conn.execute("SELECT mode, replay_at FROM investigations WHERE id = %s", (inv_id,)).fetchone()
+    backtest = bool(inv) and inv["mode"] == "backtest"
+    # A backtest runs with the clock set back to the replay time, so every query treats it as the present.
+    with tm.replay(inv["replay_at"]) if backtest else nullcontext():
+        _investigate(inv_id, model or MODEL, backtest)
+
+
+def _investigate(inv_id: int, model: str, backtest: bool) -> None:
     with db.connect() as conn:
         if _spent_today(conn) >= DAILY_BUDGET_USD:
             conn.execute(
@@ -234,7 +246,7 @@ def investigate(inv_id: int) -> None:
             log.warning("investigation #%s skipped: daily budget reached", inv_id)
             return
 
-        conn.execute("UPDATE investigations SET status = 'running', model = %s WHERE id = %s", (MODEL, inv_id))
+        conn.execute("UPDATE investigations SET status = 'running', model = %s WHERE id = %s", (model, inv_id))
         incidents = conn.execute(
             "SELECT * FROM incidents WHERE investigation_id = %s ORDER BY started_at", (inv_id,)
         ).fetchall()
@@ -256,7 +268,9 @@ def investigate(inv_id: int) -> None:
         log.warning("investigation #%s: %d alert(s), fingerprint %s", inv_id, len(incidents), briefing.exact_key)
 
         # 1. Exact cache: a confirmed answer for this same incident costs nothing.
-        cached = conn.execute(
+        # Backtests skip both caches: a cached answer may come from after the replay
+        # time, and the point of a backtest is what Loki would have worked out then.
+        cached = None if backtest else conn.execute(
             "SELECT * FROM report_cache WHERE exact_key = %s AND confirmed AND expires_at > now()",
             (briefing.exact_key,),
         ).fetchone()
@@ -274,7 +288,7 @@ def investigate(inv_id: int) -> None:
             return
 
         # 2. Hint cache: a similar earlier incident becomes a lead in the briefing.
-        similar = conn.execute(
+        similar = None if backtest else conn.execute(
             # Only human-confirmed answers become hints: an unconfirmed (possibly wrong)
             # answer would otherwise reinforce its own mistake next time.
             "SELECT * FROM report_cache WHERE fingerprint = %s AND confirmed AND expires_at > now() "
@@ -295,20 +309,24 @@ def investigate(inv_id: int) -> None:
         # 3. Investigate with the cheap model; escalate only if it's unsure and budget allows.
         # Ollama ignores the key but the SDK needs one.
         client = (anthropic.Anthropic(api_key="ollama", base_url=OLLAMA_URL) if LOCAL
-                  else None if MODEL == "fake" else anthropic.Anthropic())
-        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, MODEL, briefing, MAX_COST_USD)
-        model_used = MODEL
-        if ESCALATE_MODEL and report["confidence"] < ESCALATE_BELOW and cost < MAX_COST_USD:
+                  else None if model == "fake" else anthropic.Anthropic())
+        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, model, briefing, MAX_COST_USD)
+        model_used = model
+        # The fake model never escalates: a free run must stay free.
+        if ESCALATE_MODEL and model != "fake" and report["confidence"] < ESCALATE_BELOW and cost < MAX_COST_USD:
             log.warning("investigation #%s: confidence %.2f, escalating to %s", inv_id, report["confidence"], ESCALATE_MODEL)
             strong = anthropic.Anthropic()
             report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, MAX_COST_USD - cost)
-            steps, t_in, t_out, cost, model_used = steps + s2, t_in + i2, t_out + o2, cost + c2, f"{MODEL}+{ESCALATE_MODEL}"
+            steps, t_in, t_out, cost, model_used = steps + s2, t_in + i2, t_out + o2, cost + c2, f"{model}+{ESCALATE_MODEL}"
 
         conn.execute(
             "UPDATE investigations SET status = 'done', finished_at = now(), report = %s, steps = %s, input_tokens = %s, "
             "output_tokens = %s, cost_usd = %s, model = %s, cache_hit = %s WHERE id = %s",
             (json.dumps(report), steps, t_in, t_out, round(cost, 4), model_used, cache_hit, inv_id),
         )
+        if backtest:
+            log.warning("backtest #%s (as of %s) done\n%s", inv_id, tm.now().isoformat(), render(inv_id, report, steps, cost))
+            return  # never cached and never posted to Slack: it's not a live incident
         # Remember the answer. It's reused as-is only after a human confirms it (POST /investigations/<id>/confirm).
         conn.execute(
             "INSERT INTO report_cache (exact_key, fingerprint, investigation_id, report, expires_at) "

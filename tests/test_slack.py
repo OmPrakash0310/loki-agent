@@ -179,7 +179,7 @@ class FakeConn:
 
 
 def _inv(**kw):
-    return {"id": 12, "status": "done", "cache_key": "fp|d-42", "fingerprint": "fp", "cache_hit": None,
+    return {"id": 12, "mode": "live", "status": "done", "cache_key": "fp|d-42", "fingerprint": "fp", "cache_hit": None,
             "report": REPORT, **kw}
 
 
