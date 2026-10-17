@@ -154,18 +154,19 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
     if dep_lines:
         out += ["", "## Dependency latency (calls from a service to its database / external APIs): before -> now", *dep_lines]
 
-    lines = tm.fetch_logs(None, start, end, errors_only=True)
+    lines = tm.error_lines(None, start, end)
     onset = _error_onset(lines)
     clusters = tm.cluster_logs(lines, top=6)
     out += ["", f"## Error log patterns since {tm._hms(start)} ({len(lines)} error lines in total)"]
     if not clusters:
         # No error lines can mean "no errors" or "no logs at all". Tell the model which.
-        any_logs = tm.fetch_logs(None, start, end, errors_only=False, limit=1)
+        any_logs = tm.logs_present(start, end)
         out.append("- none" if any_logs else
                    "- WARNING: no logs at all were received in this window. The log pipeline may be broken; "
                    "treat log evidence as missing, not as 'no errors'.")
     for c in clusters:
         out.append(f"- x{c['count']} in {', '.join(c['services'])} ({c['first_seen']} to {c['last_seen']}): {c['example']}")
+    out += [f"- note: {n}" for n in tm.error_notes()]
     if onset:
         out.append("- first error per service: " + ", ".join(f"{s} {tm._hms(t)}" for s, t in onset.items()))
     if floor and floor > first_alert - LOOKBACK:
@@ -178,6 +179,7 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
 
     deploys = tm.deploys_between(first_alert - timedelta(hours=2), end)
     out += ["", "## Deploys in the 2 hours before the first alert"]
+    out += [f"- note: {n}" for n in tm.deploy_notes()]
     if not deploys:
         out.append("- none")
     running = {d["id"] for d in latest_deploys(deploys, end)}

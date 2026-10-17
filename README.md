@@ -25,6 +25,7 @@ Inside `agent/`:
 | `investigator.py` | The model loop: caches, budgets, step limit, cost logging, report |
 | `telemetry.py` | Talks to Grafana Loki, Prometheus and the deploy history |
 | `slack.py` | Slack reports with Confirm / Wrong / View trace buttons |
+| `sources/` | Pluggable deploy and error sources: JSON file, Grafana Loki, GitHub, Sentry |
 | `redact.py` | Removes secrets and personal data before anything reaches the model |
 
 ## Run it
@@ -179,3 +180,62 @@ are refused with 401.
 
 Note: `LOKI_PUBLIC_URL` exposes the agent's read endpoints (traces include log
 lines) to whoever can reach that URL. Put it behind your VPN or an auth proxy.
+
+## Integrations
+
+By default Loki reads the demo stack: deploys from `state/deploys.json` and
+errors from Grafana Loki. To investigate a real team's stack, point it at
+GitHub (deploy history and diffs) and/or Sentry (errors) instead. Metrics
+still come from Prometheus (`PROM_URL`). Everything is read-only, and all text
+from these sources goes through `redact.py` before the model sees it.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOKI_DEPLOYS_SOURCE` | `file` | `file` (`DEPLOYS_FILE`) or `github` |
+| `LOKI_ERRORS_SOURCE` | `loki` | `loki` (Grafana Loki at `LOKI_URL`) or `sentry` |
+| `GITHUB_TOKEN` | | GitHub token (see scopes below) |
+| `GITHUB_REPOS` | | `owner/repo=service,owner/repo2=service2`: which repo deploys which service. The service names should match the `service` label in Prometheus |
+| `GITHUB_ENVIRONMENT` | all | Only count deployments to this environment, e.g. `production` |
+| `GITHUB_API_URL` | `https://api.github.com` | For GitHub Enterprise Server: `https://<host>/api/v3` |
+| `SENTRY_TOKEN` | | Sentry auth token (see scopes below) |
+| `SENTRY_ORG` | | Organization slug |
+| `SENTRY_PROJECTS` | | `project-slug=service,...`: which Sentry project is which service |
+| `SENTRY_BASE_URL` | `https://sentry.io` | Self-hosted Sentry, or `https://de.sentry.io` for the EU region |
+
+**Token scopes (read-only):**
+- GitHub fine-grained token: repository permissions *Metadata*, *Contents*, *Deployments* and
+  *Pull requests*, all **read-only**, on the listed repos. A classic token needs `repo`
+  (which also grants write, so prefer fine-grained).
+- Sentry: an internal integration or user auth token with `project:read` and `event:read`.
+
+**How GitHub becomes deploy history.** Per repo, Loki uses the first of these that has
+any data: the Deployments API (what Actions environments, Argo CD and others record),
+then pull requests merged into the default branch, then commits on the default branch.
+`git_diff` compares a deployment with the previous one to the same environment (or shows
+the PR's changes, or the commit). Big diffs are cut down to the full file list plus the
+most relevant hunks: source before tests and docs, lockfiles and generated files never.
+
+**How Sentry becomes error patterns.** For each project, the issues seen in the window
+(top 20 by frequency) and their events in the window become error lines, so the
+briefing's patterns, first-error-per-service and suspect ranking work as they do with logs.
+
+**Rate limits and failures.** If GitHub or Sentry rate-limits Loki (403/429), it does not
+wait: it uses what it already fetched and tells the model the data is partial
+(a `note` in the briefing and in tool results). A repo or project it cannot read is
+skipped with a note.
+
+**Limitations.**
+- Deployment time is when the deployment was created, not when it finished.
+- Sentry counts are events Loki listed (up to 200 per issue per query), so they are a
+  lower bound on busy issues; a note says so.
+- With `LOKI_ERRORS_SOURCE=sentry`, `query_logs` with `errors_only=false` still reads
+  Grafana Loki, since Sentry has no non-error logs.
+- Tested against recorded-style API payloads (`tests/test_sources.py`), not yet against a
+  live GitHub or Sentry account.
+
+Run the tests (no Docker, no network):
+
+```bash
+python3.12 -m venv .venv && .venv/bin/pip install httpx==0.27.2 pytest
+.venv/bin/pytest tests
+```

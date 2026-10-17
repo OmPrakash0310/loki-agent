@@ -1,9 +1,11 @@
 """Read-only access to logs (Grafana Loki), metrics (Prometheus) and deploy history.
 
+Deploys and error lines go through sources/ so other backends (GitHub, Sentry)
+can stand in for the demo ones.
+
 Everything returned here is compact and redacted, ready to show the model.
 """
 import contextvars
-import json
 import os
 import re
 from collections import defaultdict
@@ -12,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import sources
 from redact import redact
 
 LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100")
@@ -248,22 +251,48 @@ def services_with_dependencies() -> list[str]:
     return resp.json()["data"]
 
 
-# ---------- deploys ----------
+# ---------- deploys and errors, through pluggable sources ----------
+# Which backend answers is chosen by env vars (see sources/__init__.py). The
+# defaults are the JSON deploy file and Grafana Loki, as before.
+
+def _deployed_at(d: dict) -> datetime:
+    return d["deployed_at_dt"]
+
 
 def load_deploys():
-    try:
-        with open(DEPLOYS_FILE) as f:
-            deploys = json.load(f)
-    except FileNotFoundError:
-        return []
-    for d in deploys:
-        d["deployed_at_dt"] = datetime.fromisoformat(d["deployed_at"])
     # Deploys after the present don't exist yet (also hides their diffs from git_diff).
-    return sorted(_not_future(deploys, when=lambda d: d["deployed_at_dt"]), key=lambda d: d["deployed_at_dt"])
+    return _not_future(sources.deploys().list_deploys(None, None), when=_deployed_at)
 
 
 def deploys_between(start: datetime, end: datetime):
-    return [d for d in load_deploys() if start <= d["deployed_at_dt"] <= end]
+    return _not_future(sources.deploys().list_deploys(start, _cap(end)), when=_deployed_at)
+
+
+def deploy_diff(deploy_id: str) -> dict:
+    # In a replay, a deploy that hasn't happened yet has no diff to show.
+    if replay_time() and not any(d["id"] == deploy_id for d in load_deploys()):
+        raise ValueError(f"no deploy with id {deploy_id!r}")
+    return sources.deploys().get_diff(deploy_id)
+
+
+def error_lines(service: str | None, start: datetime, end: datetime):
+    """Error lines as (time, service, line), oldest first, from the configured errors source."""
+    end = _cap(end)
+    if start >= end:
+        return []
+    return _not_future(sources.errors().error_lines(service, start, end))
+
+
+def logs_present(start: datetime, end: datetime) -> bool:
+    return sources.errors().logs_present(start, end)
+
+
+def deploy_notes() -> list[str]:
+    return sources.deploys().notes()
+
+
+def error_notes() -> list[str]:
+    return sources.errors().notes()
 
 
 def now() -> datetime:
