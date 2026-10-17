@@ -389,3 +389,22 @@ def test_load_cases_and_grade(tmp_path):
     assert cli.grade(wrong, cases[0]["expected"]) == {"right_service": False, "right_cause_type": True, "right_deploy": False}
     assert cli.grade({"trigger": "dependency", "deploy_id": ""}, cases[1]["expected"]) == {
         "right_cause_type": True, "no_deploy_blamed": True}
+
+
+class RecordedConn(FakeConn):
+    """Live alerts Loki recorded: one at the replayed time and one from the next incident, 3 minutes later."""
+
+    def execute(self, sql, params=()):
+        if "FROM incidents WHERE mode = 'live'" in sql:
+            self.log.append((sql, params))
+            row = {"alert_name": "HighErrorRate", "service": "payments-svc", "severity": "critical", "summary": "s"}
+            return Rows([{**row, "started_at": ALERT}, {**row, "started_at": ALERT + timedelta(minutes=3)}])
+        return super().execute(sql, params)
+
+
+def test_recorded_alerts_after_the_replay_clock_are_not_replayed():
+    """Found in a live run: alerts from the next incident leaked into the replay."""
+    conn = RecordedConn()
+    bt_agent.create(conn, ALERT, [], delay_s=60)
+    replayed = [p[5] for s, p in conn.log if "INSERT INTO incidents" in s]
+    assert replayed == [ALERT]

@@ -76,6 +76,9 @@ def create(conn, at: datetime, alerts: list[tuple[str, str]], delay_s: int = DEF
         raise ValueError(f"no recorded alerts within {NEAR} of {at.isoformat()}; pass alerts explicitly")
     first = min(i["started_at"] for i in incidents) if incidents else at
     replay_at = first + timedelta(seconds=delay_s)
+    # Alerts recorded after Loki's replayed clock are the future (often the next
+    # incident): replaying them would leak what happened next.
+    incidents = [i for i in incidents if i["started_at"] <= replay_at]
     if replay_at > datetime.now(timezone.utc):
         raise ValueError(f"replay time {replay_at.isoformat()} is in the future")
     if alerts:
