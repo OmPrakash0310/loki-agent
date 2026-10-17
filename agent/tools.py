@@ -126,11 +126,17 @@ def _clip(minutes, default, maximum):
 
 def query_logs(service=None, contains=None, minutes=20, errors_only=True):
     m = _clip(minutes, 20, 120)
-    lines = tm.fetch_logs(service or None, _since(m), tm.now(), errors_only is not False)
+    errors_only = errors_only is not False
+    if errors_only:
+        lines = tm.error_lines(service or None, _since(m), tm.now())
+    else:  # full logs only exist in Grafana Loki
+        lines = tm.fetch_logs(service or None, _since(m), tm.now(), False)
     if contains:
         lines = [l for l in lines if contains.lower() in l[2].lower()]
     clusters = tm.cluster_logs(lines)
-    return {"window_minutes": m, "matching_lines": len(lines), "patterns": clusters}
+    out = {"window_minutes": m, "matching_lines": len(lines), "patterns": clusters}
+    notes = tm.error_notes() if errors_only else []
+    return {**out, "notes": notes} if notes else out
 
 
 def query_metrics(metric, service, minutes=20):
@@ -154,17 +160,16 @@ def query_metrics(metric, service, minutes=20):
 
 def recent_deploys(minutes=120):
     m = _clip(minutes, 120, 1440)
-    return [
+    deploys = [
         {k: d[k] for k in ("id", "service", "version", "author", "message", "deployed_at")}
         for d in tm.deploys_between(tm.minutes_ago(m), tm.now())
     ]
+    notes = tm.deploy_notes()  # e.g. GitHub rate limit: say the list may be incomplete
+    return {"deploys": deploys, "notes": notes} if notes else deploys
 
 
 def git_diff(deploy_id):
-    for d in tm.load_deploys():
-        if d["id"] == deploy_id:
-            return {"deploy_id": deploy_id, "service": d["service"], "version": d["version"], "diff": d["diff"]}
-    raise ValueError(f"no deploy with id {deploy_id!r}")
+    return tm.deploy_diff(deploy_id)
 
 
 def search_past_incidents(query):

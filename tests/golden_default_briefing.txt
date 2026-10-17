@@ -1,0 +1,28 @@
+# Incident briefing
+
+## Alerts (grouped into this one incident)
+- 16:22:00 HighErrorRate on payments-svc (critical): 5xx > 5%
+
+## Metrics: typical value before the first alert -> now
+- payments-svc: error_rate 0.02 -> 0.25; p95_latency_seconds 0.02 -> 0.25; request_rate 0.02 -> 0.25
+- shop-api: error_rate 0.02 -> 0.25; p95_latency_seconds 0.02 -> 0.25; request_rate 0.02 -> 0.25
+
+## Dependency latency (calls from a service to its database / external APIs): before -> now
+- payments-svc -> postgres: p95 0.012s -> 0.012s
+
+## Error log patterns since 16:07:00 (4 error lines in total)
+- x2 in payments-svc (16:21:02 to 16:21:05): 2026-10-15 16:21:05,120 ERROR charge failed: KeyError: 'currency'
+- x1 in payments-svc (16:21:01 to 16:21:01): KeyError: 'currency'
+- x1 in shop-api (16:21:03 to 16:21:03): 2026-10-15 16:21:03,500 ERROR checkout failed: payments-svc returned 500 for user [EMAIL]
+- first error per service: payments-svc 16:21:01, shop-api 16:21:03
+
+## Deploys in the 2 hours before the first alert
+- b2e4a91 payments-svc v2.4.0 at 16:05:00 by meera: Log charge latency
+
+## Suspects ranked by simple rules (a starting point: verify, don't trust blindly)
+1. deploy b2e4a91 to payments-svc (score 3): deployed to payments-svc, where the failure started (other services' errors point at payments-svc (1 lines)); shipped 16 min before the first error
+2. a non-deploy cause in payments-svc (score 1): other services' errors point at payments-svc (1 lines)
+
+Current time: 16:30:00 UTC.
+--
+06b045787dedb4b0 06b045787dedb4b0:b2e4a91
