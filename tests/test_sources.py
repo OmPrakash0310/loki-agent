@@ -5,13 +5,10 @@ All HTTP is mocked with httpx.MockTransport. Nothing here talks to the network.
 import json
 import os
 import sys
-import types
 from datetime import datetime, timezone
 
 import httpx
 import pytest
-
-sys.modules.setdefault("db", types.ModuleType("db"))  # tools.py imports db (psycopg); not needed here
 
 import context  # noqa: E402
 import sources  # noqa: E402
