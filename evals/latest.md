@@ -1,12 +1,11 @@
-# Loki eval 20261017-184945 (fake)
+# Loki eval 20261017-191027 (claude-haiku-4-5)
 
 | Scenario | Runs | Correct | Accuracy | Avg time | Avg cost | Avg steps |
 |---|---|---|---|---|---|---|
-| bad_deploy | 1 | 1 | 100% | 81s | $0.0000 | 3.0 |
-| slow_db | 1 | 0 | 0% | 86s | $0.0000 | 2.0 |
-| timeout | 1 | 0 | 0% | 91s | $0.0000 | 2.0 |
-| **Total** | 3 | 1 | **33%** | | $0.0000 total | |
+| bad_deploy | 5 | 5 | 100% | 99s | $0.0181 | 3.2 |
+| slow_db | 5 | 4 | 80% | 122s | $0.0300 | 6.8 |
+| timeout | 5 | 5 | 100% | 134s | $0.0297 | 7.2 |
+| **Total** | 15 | 14 | **93%** | | $0.3893 total | |
 
 ## Misses
-- slow_db run 1 (#29): missed right_service, right_cause_type, names_database. Loki said: [fake model] payments-svc looks like the source
-- timeout run 1 (#30): missed right_service, right_cause_type, names_card_network. Loki said: [fake model] payments-svc looks like the source
+- slow_db run 5 (#41): missed right_cause_type. Loki said: payments-svc experienced sudden latency spike (0.23s to 5.75s p95) starting at 19:39:40, causing shop-api timeouts, while its external dependencies remained res
