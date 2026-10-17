@@ -23,6 +23,7 @@ Inside `agent/`:
 | `tools.py` | Read-only tools Claude can call: logs, metrics, deploys, diffs, past incidents |
 | `investigator.py` | The model loop: caches, budgets, step limit, cost logging, report |
 | `telemetry.py` | Talks to Grafana Loki, Prometheus and the deploy history |
+| `slack.py` | Slack reports with Confirm / Wrong / View trace buttons |
 | `redact.py` | Removes secrets and personal data before anything reaches the model |
 
 ## Run it
@@ -72,6 +73,7 @@ Loki has to find a different kind of cause.
 - `localhost:8088/investigations`: all investigations, with status, steps and cost
 - `localhost:8088/investigations/<id>/report`: the root-cause report
 - `localhost:8088/investigations/<id>/trace`: every tool call Loki made
+- `POST localhost:8088/investigations/<id>/reject`: mark a report wrong (optional body `{"reason": "..."}`)
 - `localhost:8088/incidents`: alerts and which investigation they joined
 - `localhost:3000`: Grafana (Explore → Loki for logs)
 
@@ -89,4 +91,41 @@ Set these in `.env` (see `.env.example`).
 | `LOKI_DAILY_BUDGET_USD` | `1.00` | Spending cap per day |
 | `LOKI_MAX_STEPS` | `8` | Model calls before Loki must report |
 | `LOKI_OLLAMA_URL` | | Point at Ollama to use a free local model |
-| `SLACK_WEBHOOK_URL` | | Optional: post reports to Slack |
+| `SLACK_BOT_TOKEN` | | Slack app bot token; with `SLACK_CHANNEL`, reports get buttons |
+| `SLACK_CHANNEL` | | Channel to post reports in |
+| `SLACK_SIGNING_SECRET` | | Verifies button clicks come from Slack |
+| `LOKI_PUBLIC_URL` | | Agent's public base URL, for the "View trace" button |
+| `SLACK_WEBHOOK_URL` | | Fallback: plain-text reports to an incoming webhook |
+
+## Slack setup
+
+Loki posts each report to Slack with three buttons: **✅ Root cause correct**
+(same as `POST /investigations/<id>/confirm`), **❌ Wrong** (recorded in the
+`feedback` table, and the answer is never reused from cache), and **View trace**.
+The message then shows who confirmed or rejected it.
+
+1. Create an app at https://api.slack.com/apps → *Create New App* → *From scratch*.
+2. *OAuth & Permissions* → *Bot Token Scopes*: add `chat:write`. Install the app
+   to your workspace and copy the *Bot User OAuth Token* (`xoxb-...`).
+3. *Basic Information* → copy the *Signing Secret*.
+4. *Interactivity & Shortcuts* → turn on, and set the *Request URL* to
+   `https://<your-public-host>/slack/interactions`. Slack must reach the agent
+   (port 8088) over HTTPS; for a laptop demo, a tunnel such as
+   `ngrok http 8088` or `cloudflared tunnel --url http://localhost:8088` works.
+5. Invite the app to your channel: `/invite @<app name>`.
+6. In `.env`:
+   ```bash
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_CHANNEL=C0123456789        # or #incidents
+   SLACK_SIGNING_SECRET=...
+   LOKI_PUBLIC_URL=https://<your-public-host>
+   ```
+   Then recreate the agent: `docker compose up -d agent`.
+
+Without a bot token, `SLACK_WEBHOOK_URL` still works and posts plain text
+reports (incoming webhooks can't receive button clicks). Requests to
+`/slack/interactions` without a valid Slack signature, or older than 5 minutes,
+are refused with 401.
+
+Note: `LOKI_PUBLIC_URL` exposes the agent's read endpoints (traces include log
+lines) to whoever can reach that URL. Put it behind your VPN or an auth proxy.

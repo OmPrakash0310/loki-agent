@@ -5,12 +5,14 @@ import json
 import logging
 import threading
 import time
+from urllib.parse import parse_qs
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse, Response
 
 import db
 import investigator
+import slack
 import tools
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s agent %(message)s")
@@ -169,10 +171,14 @@ def trace(inv_id: int):
         ).fetchall()
 
 
-@app.post("/investigations/{inv_id}/confirm")
-def confirm(inv_id: int):
-    """A human confirms the root cause was right (the fix worked). Only confirmed
-    answers are reused for free when the exact same incident happens again."""
+def _record_feedback(conn, inv_id: int, verdict: str, who: str | None, user_id: str | None, reason: str | None = None):
+    conn.execute(
+        "INSERT INTO feedback (investigation_id, verdict, user_id, user_name, reason) VALUES (%s, %s, %s, %s, %s)",
+        (inv_id, verdict, user_id, who, reason),
+    )
+
+
+def _confirm(inv_id: int, who: str | None = None, user_id: str | None = None) -> dict:
     with db.connect() as conn:
         inv = _get_investigation(conn, inv_id)
         if inv["status"] != "done" or not inv["cache_key"] or (inv["cache_hit"] or "").startswith("exact:"):
@@ -184,7 +190,46 @@ def confirm(inv_id: int):
             "report = EXCLUDED.report, confirmed = true, created_at = now(), expires_at = EXCLUDED.expires_at",
             (inv["cache_key"], inv["fingerprint"], inv_id, json.dumps(inv["report"]), investigator.CACHE_TTL_DAYS),
         )
+        _record_feedback(conn, inv_id, "confirmed", who, user_id)
     return {"confirmed": inv_id, "cache_key": inv["cache_key"]}
+
+
+def _reject(inv_id: int, who: str | None = None, user_id: str | None = None, reason: str | None = None) -> dict:
+    with db.connect() as conn:
+        inv = _get_investigation(conn, inv_id)
+        if inv["status"] != "done":
+            raise HTTPException(409, "only a finished report can be rejected")
+        # A wrong answer must never be reused for free, even if someone confirmed it
+        # earlier. For a cache hit this un-confirms the original answer it came from.
+        if inv["cache_key"]:
+            conn.execute("UPDATE report_cache SET confirmed = false WHERE exact_key = %s", (inv["cache_key"],))
+        _record_feedback(conn, inv_id, "rejected", who, user_id, reason)
+    return {"rejected": inv_id}
+
+
+@app.post("/investigations/{inv_id}/confirm")
+def confirm(inv_id: int):
+    """A human confirms the root cause was right (the fix worked). Only confirmed
+    answers are reused for free when the exact same incident happens again."""
+    return _confirm(inv_id)
+
+
+@app.post("/investigations/{inv_id}/reject")
+def reject(inv_id: int, reason: str | None = Body(None, embed=True)):
+    """A human says the root cause was wrong. Optional JSON body: {"reason": "..."}."""
+    return _reject(inv_id, reason=reason)
+
+
+@app.post("/slack/interactions")
+async def slack_interactions(request: Request, background: BackgroundTasks):
+    """Button clicks from Slack. Ack at once; the DB work and message update run after."""
+    body = await request.body()
+    if not slack.verify_signature(body, request.headers.get("X-Slack-Request-Timestamp", ""),
+                                  request.headers.get("X-Slack-Signature", "")):
+        raise HTTPException(401, "bad slack signature")
+    payload = json.loads(parse_qs(body.decode()).get("payload", ["{}"])[0])
+    background.add_task(slack.handle_interaction, payload, _confirm, _reject)
+    return Response(status_code=200)
 
 
 @app.get("/stats")

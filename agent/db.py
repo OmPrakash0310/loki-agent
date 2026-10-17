@@ -74,6 +74,19 @@ ALTER TABLE trace_steps ADD COLUMN IF NOT EXISTS output_tokens INT;
 ALTER TABLE trace_steps ADD COLUMN IF NOT EXISTS cache_read_tokens INT;
 ALTER TABLE trace_steps ADD COLUMN IF NOT EXISTS cache_write_tokens INT;
 ALTER TABLE trace_steps ADD COLUMN IF NOT EXISTS cost_usd NUMERIC(10, 5);
+
+-- What humans said about a report (Slack buttons or the API). Kept as a history,
+-- so a later click doesn't erase an earlier one.
+CREATE TABLE IF NOT EXISTS feedback (
+    id SERIAL PRIMARY KEY,
+    investigation_id INT NOT NULL REFERENCES investigations(id),
+    verdict TEXT NOT NULL,  -- confirmed | rejected
+    user_id TEXT,           -- Slack user id, NULL from the API
+    user_name TEXT,
+    reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS feedback_investigation ON feedback (investigation_id);
 """
 
 

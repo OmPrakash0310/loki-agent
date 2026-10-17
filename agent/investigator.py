@@ -17,10 +17,10 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import anthropic
-import httpx
 
 import context
 import db
+import slack
 import tools
 
 log = logging.getLogger("agent")
@@ -37,7 +37,6 @@ CACHE_TTL_DAYS = 7
 # open-source models for free. Claude-only features are switched off there.
 OLLAMA_URL = os.environ.get("LOKI_OLLAMA_URL", "")
 LOCAL = bool(OLLAMA_URL)
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 
 # USD per million tokens: input, output, cache write, cache read.
 PRICES = {
@@ -325,7 +324,7 @@ def investigate(inv_id: int) -> None:
 def _finish(inv_id: int, report: dict, steps: int, cost: float):
     text = render(inv_id, report, steps, cost)
     log.warning("investigation #%s done\n%s", inv_id, text)
-    post_to_slack(text)
+    slack.post_report(inv_id, report, steps, cost, text)
 
 
 def render(inv_id: int, r: dict, steps: int, cost: float) -> str:
@@ -347,11 +346,3 @@ def render(inv_id: int, r: dict, steps: int, cost: float) -> str:
     ]
     return "\n".join(lines)
 
-
-def post_to_slack(text: str) -> None:
-    if not SLACK_WEBHOOK_URL:
-        return
-    try:
-        httpx.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10).raise_for_status()
-    except httpx.HTTPError as e:
-        log.error("slack post failed: %s", e)
