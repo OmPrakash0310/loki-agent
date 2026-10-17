@@ -5,11 +5,14 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime
 from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
+from pydantic import BaseModel
 
+import backtest
 import db
 import investigator
 import slack
@@ -47,7 +50,8 @@ def _attach_to_investigation(conn, incident_id: int) -> tuple[int, bool]:
     """Attach an incident to the current alert storm's investigation, or open a new one."""
     with _group_lock:
         row = conn.execute(
-            "SELECT id FROM investigations WHERE status IN ('queued', 'running') "
+            # Never let a live alert join a backtest that happens to be running.
+            "SELECT id FROM investigations WHERE status IN ('queued', 'running') AND mode = 'live' "
             "AND created_at > now() - make_interval(secs => %s) ORDER BY id DESC LIMIT 1",
             (JOIN_WINDOW_S,),
         ).fetchone()
@@ -111,7 +115,7 @@ async def receive_alerts(request: Request):
 def list_incidents():
     with db.connect() as conn:
         return conn.execute(
-            "SELECT id, alert_name, service, severity, summary, status, started_at, resolved_at, investigation_id "
+            "SELECT id, alert_name, service, severity, summary, status, started_at, resolved_at, investigation_id, mode "
             "FROM incidents ORDER BY id DESC LIMIT 50"
         ).fetchall()
 
@@ -120,14 +124,15 @@ def list_incidents():
 def list_investigations():
     with db.connect() as conn:
         return conn.execute(
-            "SELECT id, status, created_at, finished_at, steps, cost_usd, report->>'summary' AS summary, error "
+            "SELECT id, mode, replay_at, status, created_at, finished_at, steps, cost_usd, "
+            "report->>'summary' AS summary, error "
             "FROM investigations ORDER BY id DESC LIMIT 20"
         ).fetchall()
 
 
 def _get_investigation(conn, inv_id: int | None):
-    if inv_id is None:
-        row = conn.execute("SELECT * FROM investigations ORDER BY id DESC LIMIT 1").fetchone()
+    if inv_id is None:  # "latest" means the latest real incident, not a replay
+        row = conn.execute("SELECT * FROM investigations WHERE mode = 'live' ORDER BY id DESC LIMIT 1").fetchone()
     else:
         row = conn.execute("SELECT * FROM investigations WHERE id = %s", (inv_id,)).fetchone()
     if not row:
@@ -181,6 +186,8 @@ def _record_feedback(conn, inv_id: int, verdict: str, who: str | None, user_id: 
 def _confirm(inv_id: int, who: str | None = None, user_id: str | None = None) -> dict:
     with db.connect() as conn:
         inv = _get_investigation(conn, inv_id)
+        if inv["mode"] != "live":
+            raise HTTPException(409, "backtests can't be confirmed: they never feed the answer cache")
         if inv["status"] != "done" or not inv["cache_key"] or (inv["cache_hit"] or "").startswith("exact:"):
             raise HTTPException(409, "only a finished, freshly investigated report can be confirmed")
         conn.execute(
@@ -201,7 +208,8 @@ def _reject(inv_id: int, who: str | None = None, user_id: str | None = None, rea
             raise HTTPException(409, "only a finished report can be rejected")
         # A wrong answer must never be reused for free, even if someone confirmed it
         # earlier. For a cache hit this un-confirms the original answer it came from.
-        if inv["cache_key"]:
+        # A backtest never came from the cache, so rejecting one leaves live answers alone.
+        if inv["cache_key"] and inv["mode"] == "live":
             conn.execute("UPDATE report_cache SET confirmed = false WHERE exact_key = %s", (inv["cache_key"],))
         _record_feedback(conn, inv_id, "rejected", who, user_id, reason)
     return {"rejected": inv_id}
@@ -242,13 +250,18 @@ def stats():
             "count(*) FILTER (WHERE cache_hit LIKE 'exact:%%') AS answered_from_cache, "
             "count(*) FILTER (WHERE cache_hit LIKE 'hint:%%') AS used_cache_hint, "
             "coalesce(sum(cost_usd) FILTER (WHERE created_at >= date_trunc('day', now())), 0) AS spent_today_usd "
-            "FROM investigations WHERE status = 'done'"
+            "FROM investigations WHERE status = 'done' AND mode = 'live'"
         ).fetchone()
         per_model = conn.execute(
-            "SELECT model, count(*) AS calls, sum(input_tokens) AS input_tokens, sum(output_tokens) AS output_tokens, "
-            "sum(cache_read_tokens) AS cache_read_tokens, sum(cost_usd) AS cost_usd "
-            "FROM trace_steps WHERE tool = 'llm' GROUP BY model"
+            "SELECT t.model, count(*) AS calls, sum(t.input_tokens) AS input_tokens, sum(t.output_tokens) AS output_tokens, "
+            "sum(t.cache_read_tokens) AS cache_read_tokens, sum(t.cost_usd) AS cost_usd "
+            "FROM trace_steps t JOIN investigations i ON i.id = t.investigation_id "
+            "WHERE t.tool = 'llm' AND i.mode = 'live' GROUP BY t.model"
         ).fetchall()
+        # Backtests are reported apart. Their spend still counts toward the daily budget.
+        backtests = conn.execute(
+            "SELECT count(*) AS runs, coalesce(sum(cost_usd), 0) AS cost_usd FROM investigations WHERE mode = 'backtest'"
+        ).fetchone()
     return {
         **totals,
         "daily_budget_usd": investigator.DAILY_BUDGET_USD,
@@ -257,4 +270,45 @@ def stats():
         "escalation_model": investigator.ESCALATE_MODEL or None,
         "per_model": per_model,
         "tool_cache": tools.tool_cache_stats,
+        "backtests": backtests,
     }
+
+
+class BacktestRequest(BaseModel):
+    at: datetime  # when the (first) alert fired, ISO 8601 with a timezone
+    alerts: list[str] | str | None = None  # "HighErrorRate:payments-svc"; omit to replay the alerts recorded then
+    model: str | None = None  # e.g. "fake" for a free run; default LOKI_MODEL
+    delay_s: int = backtest.DEFAULT_DELAY_S
+
+
+@app.post("/backtest")
+def run_backtest(req: BacktestRequest):
+    """Replay a past incident synchronously: Loki investigates it with the clock set
+    back, so nothing after that moment is visible. Returns the full investigation."""
+    if req.model and req.model not in backtest.ALLOWED_MODELS:
+        raise HTTPException(400, f"model must be one of {sorted(backtest.ALLOWED_MODELS)}")
+    try:
+        alerts = backtest.parse_alerts(req.alerts)
+        with db.connect() as conn:
+            inv_id = backtest.create(conn, req.at, alerts, req.delay_s)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    log.warning("backtest #%s: replaying %s", inv_id, req.at.isoformat())
+    try:
+        investigator.investigate(inv_id, model=req.model)
+    except Exception as e:
+        log.exception("backtest #%s failed", inv_id)
+        with db.connect() as conn:
+            conn.execute(
+                "UPDATE investigations SET status = 'failed', finished_at = now(), error = %s WHERE id = %s",
+                (f"{type(e).__name__}: {e}", inv_id),
+            )
+    with db.connect() as conn:
+        inv = _get_investigation(conn, inv_id)
+        inv["incidents"] = conn.execute(
+            "SELECT alert_name, service, severity, summary, started_at FROM incidents WHERE investigation_id = %s",
+            (inv_id,),
+        ).fetchall()
+    if inv["status"] == "done":
+        inv["report_text"] = investigator.render(inv_id, inv["report"], inv["steps"], float(inv["cost_usd"]))
+    return inv
