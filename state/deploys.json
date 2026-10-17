@@ -106,5 +106,32 @@
     "message": "Revert \"Support multi-currency charges\" (ce66503)",
     "deployed_at": "2026-10-17T18:25:52.621947+00:00",
     "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n-    # Multi-currency: convert using the currency the shop sends\n-    currency = payload[\"currency\"]\n-    amount = payload[\"amount\"] * FX_RATES[currency]\n+    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
+  },
+  {
+    "id": "ef9658d",
+    "service": "payments-svc",
+    "version": "v2.5.0",
+    "author": "ravi",
+    "message": "Support multi-currency charges",
+    "deployed_at": "2026-10-17T18:49:45.849799+00:00",
+    "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n+    # Multi-currency: convert using the currency the shop sends\n+    currency = payload[\"currency\"]\n+    amount = payload[\"amount\"] * FX_RATES[currency]\n-    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
+  },
+  {
+    "id": "b8b4787",
+    "service": "payments-svc",
+    "version": "v2.5.1",
+    "author": "ravi",
+    "message": "Revert \"Support multi-currency charges\" (ef9658d)",
+    "deployed_at": "2026-10-17T18:51:07.137789+00:00",
+    "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n-    # Multi-currency: convert using the currency the shop sends\n-    currency = payload[\"currency\"]\n-    amount = payload[\"amount\"] * FX_RATES[currency]\n+    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
+  },
+  {
+    "id": "645ae30",
+    "service": "payments-svc",
+    "version": "v2.5.0",
+    "author": "ravi",
+    "message": "Support multi-currency charges",
+    "deployed_at": "2026-10-17T19:10:27.619138+00:00",
+    "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n+    # Multi-currency: convert using the currency the shop sends\n+    currency = payload[\"currency\"]\n+    amount = payload[\"amount\"] * FX_RATES[currency]\n-    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
   }
 ]

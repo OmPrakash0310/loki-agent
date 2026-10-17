@@ -141,6 +141,13 @@ def _render_report(inv_id: int | None) -> str:
     return investigator.render(inv["id"], inv["report"], inv["steps"], float(inv["cost_usd"]))
 
 
+@app.get("/investigations/{inv_id}")
+def get_investigation(inv_id: int):
+    """The full investigation, including the structured report (used by the evals)."""
+    with db.connect() as conn:
+        return _get_investigation(conn, inv_id)
+
+
 @app.get("/investigations/latest/report", response_class=PlainTextResponse)
 def latest_report():
     return _render_report(None)

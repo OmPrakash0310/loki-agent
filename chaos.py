@@ -74,6 +74,9 @@ elif mode == "none":
         print(f"recorded rollback deploy {deploy_id}")
 
 # Ground truth lives only on your Mac; the agent never sees it.
-with open("ground_truth.jsonl", "a") as f:
-    f.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "mode": mode}) + "\n")
+with open(Path(__file__).parent / "ground_truth.jsonl", "a") as f:
+    truth = {"at": datetime.now(timezone.utc).isoformat(), "mode": mode}
+    if mode == "bad_deploy":
+        truth["deploy_id"] = deploy_id  # the eval checks Loki names this exact deploy
+    f.write(json.dumps(truth) + "\n")
 print(f"payments-svc chaos mode -> {mode}")

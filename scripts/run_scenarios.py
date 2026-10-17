@@ -8,6 +8,9 @@ import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 AGENT = "http://localhost:8088"
 EXPECTED = {
@@ -24,7 +27,7 @@ def get(path):
 
 
 def chaos(mode):
-    subprocess.run([sys.executable, "chaos.py", mode], check=True, capture_output=True)
+    subprocess.run([sys.executable, str(ROOT / "chaos.py"), mode], check=True, capture_output=True, cwd=ROOT)
 
 
 def wait_until_quiet(timeout=300):
@@ -39,26 +42,32 @@ def wait_until_quiet(timeout=300):
     raise TimeoutError("system didn't settle")
 
 
-def run(mode):
+def break_and_investigate(mode):
+    """Break the system, wait for Loki's investigation, put things back.
+    Returns (investigation, seconds from break to report), or (None, seconds) on timeout."""
     wait_until_quiet()
     last = max([i["id"] for i in get("/investigations")] or [0])
-    print(f"\n=== {mode}  (expected: {EXPECTED[mode]})", flush=True)
     chaos(mode)
     started = time.time()
     try:
-        while True:
+        while time.time() - started < 360:
             new = [i for i in get("/investigations") if i["id"] > last]
             if new and new[-1]["status"] in ("done", "failed", "skipped"):
-                inv = new[-1]
-                break
-            if time.time() - started > 360:
-                print("no investigation finished within 6 minutes")
-                return
+                return new[-1], time.time() - started
             time.sleep(5)
+        return None, time.time() - started
     finally:
         chaos("none")
+
+
+def run(mode):
+    print(f"\n=== {mode}  (expected: {EXPECTED[mode]})", flush=True)
+    inv, seconds = break_and_investigate(mode)
+    if inv is None:
+        print("no investigation finished within 6 minutes")
+        return
     print(f"investigation #{inv['id']}: {inv['status']}, {inv['steps']} steps, ${inv['cost_usd']}, "
-          f"{time.time() - started:.0f}s from break to report")
+          f"{seconds:.0f}s from break to report")
     print(get(f"/investigations/{inv['id']}/report"))
     print("tools used:", ", ".join(s["tool"] for s in get(f"/investigations/{inv['id']}/trace") if s["tool"] not in ("llm", "briefing")))
 
