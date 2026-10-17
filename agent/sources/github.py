@@ -11,10 +11,11 @@ GITHUB_API_URL (GitHub Enterprise), GITHUB_LOOKBACK_HOURS (window when none is g
 """
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import httpx
 
+import telemetry as tm
 from redact import redact
 from sources import parse_mapping
 from sources.base import DeploysSource
@@ -67,7 +68,7 @@ class GitHubDeploys(DeploysSource):
     # ---------- listing ----------
 
     def list_deploys(self, start, end):
-        end = end or datetime.now(timezone.utc)
+        end = end or tm.now()  # tm.now, not the wall clock, so a replayed 'present' is respected
         start = start or end - self.lookback
         self._notes = []
         out = []
