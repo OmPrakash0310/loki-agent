@@ -255,6 +255,10 @@ def services_with_dependencies() -> list[str]:
 # Which backend answers is chosen by env vars (see sources/__init__.py). The
 # defaults are the JSON deploy file and Grafana Loki, as before.
 
+def _deployed_at(d: dict) -> datetime:
+    return d["deployed_at_dt"]
+
+
 def load_deploys():
     # Deploys after the present don't exist yet (also hides their diffs from git_diff).
     return _not_future(sources.deploys().list_deploys(None, None), when=_deployed_at)
@@ -277,10 +281,6 @@ def error_lines(service: str | None, start: datetime, end: datetime):
     if start >= end:
         return []
     return _not_future(sources.errors().error_lines(service, start, end))
-
-
-def _deployed_at(d: dict) -> datetime:
-    return d["deployed_at_dt"]
 
 
 def logs_present(start: datetime, end: datetime) -> bool:

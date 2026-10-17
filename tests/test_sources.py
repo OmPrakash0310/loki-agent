@@ -401,3 +401,21 @@ def test_briefing_with_sentry_and_github(monkeypatch):
     # The model's git_diff tool then gets the compare diff for that id.
     out, is_error = tools._run_uncached("git_diff", {"deploy_id": "acme/payments:deploy:903"})
     assert not is_error and "body['currency']" in json.loads(out)["diff"]
+
+
+def test_replay_hides_github_deploys_after_the_replay_time(monkeypatch):
+    """Backtesting's no-future-data guard applies to every deploy source, not just the file."""
+    calls = []
+    gh = make_github(calls)
+    monkeypatch.setenv("LOKI_DEPLOYS_SOURCE", "github")
+    monkeypatch.setattr(github.GitHubDeploys, "from_env", classmethod(lambda cls: gh))
+    with telemetry.replay(t(16, 5)):  # deploy 903 happens at 16:10, after this "present"
+        ids = [d["id"] for d in telemetry.deploys_between(t(15, 30), t(16, 30))]
+        assert ids == ["acme/shop:pr:42"]
+        assert "acme/payments:deploy:903" not in [d["id"] for d in telemetry.load_deploys()]
+        assert [d["id"] for d in tools.recent_deploys(minutes=120)] == ["acme/payments:deploy:902", "acme/shop:pr:42"]
+        out, is_error = tools._run_uncached("git_diff", {"deploy_id": "acme/payments:deploy:903"})
+        assert is_error and "currency" not in out
+        assert not any("/compare/" in r.url.path for r in calls)  # its diff was never even fetched
+    # Outside the replay the same deploy is visible again.
+    assert "acme/payments:deploy:903" in [d["id"] for d in telemetry.deploys_between(t(15, 30), t(16, 30))]
