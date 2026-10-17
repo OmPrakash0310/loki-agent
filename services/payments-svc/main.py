@@ -57,7 +57,9 @@ def charge(body: Charge):
         # In "timeout" mode the card network hangs.
         time.sleep(5 if mode == "timeout" else 0.03)
 
-    with psycopg.connect(DB_URL) as conn, DEPENDENCY.labels("payments-svc", "postgres").time():
+    # The timer covers connecting too: when the database is struggling, the wait
+    # often happens while opening the connection, not in the query.
+    with DEPENDENCY.labels("payments-svc", "postgres").time(), psycopg.connect(DB_URL) as conn:
         if mode == "slow_db":
             # Simulates a missing index / lock: every query takes 1.5s.
             conn.execute("SELECT pg_sleep(1.5)")
