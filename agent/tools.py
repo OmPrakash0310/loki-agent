@@ -175,8 +175,11 @@ def search_past_incidents(query):
             # them back in makes Loki repeat its own mistakes.
             "SELECT i.id, i.finished_at, i.report FROM investigations i "
             "JOIN report_cache c ON c.investigation_id = i.id AND c.confirmed "
-            "WHERE (" + " OR ".join(["i.report::text ILIKE %s"] * len(words)) + ") ORDER BY i.id DESC LIMIT 5",
-            [f"%{w}%" for w in words],
+            # Live incidents only, and only ones already solved by "now": in a backtest,
+            # an answer found after the replay time would be knowledge from the future.
+            "WHERE i.mode = 'live' AND i.finished_at <= %s AND c.created_at <= %s "
+            "AND (" + " OR ".join(["i.report::text ILIKE %s"] * len(words)) + ") ORDER BY i.id DESC LIMIT 5",
+            [tm.now(), tm.now(), *[f"%{w}%" for w in words]],
         ).fetchall()
     return [
         {
@@ -240,7 +243,10 @@ tool_cache_stats = {"hits": 0, "misses": 0}
 
 def run(name: str, args: dict) -> tuple[str, bool]:
     """Run a tool. Returns (output text, is_error)."""
-    key = name + json.dumps(args, sort_keys=True)
+    # The present is part of the key: a backtest must never get a live result (from
+    # the future) back, and a live investigation must never get a stale backtest one.
+    replay_at = tm.replay_time()
+    key = name + json.dumps(args, sort_keys=True) + (replay_at.isoformat() if replay_at else "")
     with _tool_cache_lock:
         hit = _tool_cache.get(key)
         if hit and time.monotonic() - hit[0] < TOOL_CACHE_TTL_S:
