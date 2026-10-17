@@ -18,7 +18,8 @@ Inside `agent/`:
 
 | File | Job |
 |---|---|
-| `main.py` | Receives alerts, groups an alert storm into one investigation |
+| `main.py` | Receives alerts, groups an alert storm into one investigation; `POST /backtest` |
+| `backtest.py` | Replays a past incident with the clock set back (see Backtesting) |
 | `context.py` | Builds the briefing: error patterns, before/after metrics, recent deploys |
 | `tools.py` | Read-only tools Claude can call: logs, metrics, deploys, diffs, past incidents |
 | `investigator.py` | The model loop: caches, budgets, step limit, cost logging, report |
@@ -68,6 +69,54 @@ Loki has to find a different kind of cause.
 
 `localhost:8088/stats` shows spend, cache hits and tokens per model.
 
+## Backtesting
+
+Replay a past incident and see what Loki would have said at the time: "give me
+your last 5 incidents and I'll show you what Loki would have found."
+
+```bash
+# Replay the alerts Loki recorded around 21:03 UTC today
+python3 scripts/backtest.py --at 21:03 --model fake
+# Name the alerts yourself (any ISO timestamp works too)
+python3 scripts/backtest.py --at 2026-10-16T21:03:00Z --alerts "HighErrorRate:payments-svc,HighErrorRate:shop-api"
+# Several incidents, graded when the file says what the right answer was
+python3 scripts/backtest.py --incidents-file past.jsonl
+```
+
+`past.jsonl` has one incident per line (`expected` is optional; `"deploy": ""` means no deploy should be blamed):
+
+```json
+{"name": "currency deploy", "at": "2026-10-16T21:03:00Z", "alerts": "HighErrorRate:payments-svc", "expected": {"service": "payments-svc", "cause": "deploy", "deploy": "552a2c7"}}
+{"name": "slow database", "at": "2026-10-16T22:10:00Z", "expected": {"service": "payments-svc", "cause": "dependency|infrastructure", "deploy": ""}}
+```
+
+The script calls `POST /backtest {at, alerts, model, delay_s}`, which runs the investigation
+synchronously and returns it. `--model fake` costs nothing; otherwise the agent's `LOKI_MODEL`
+is used, and backtest spend counts toward the daily budget like any other.
+
+**The honesty guarantee: nothing after the replay time reaches Loki.** Loki's clock is set to
+the replay time, which is the alert time plus `--delay` (60s by default, about when a live
+investigation would start). The clock is a per-investigation context variable, so a live
+investigation running at the same time keeps the real clock. Then:
+
+- Every log, metric and dependency query has its end capped at the replay time, and every
+  result is filtered again so nothing stamped later gets through, even if a backend returns
+  more than it was asked for.
+- Deploys after the replay time don't exist, and neither do their diffs.
+- No answer cache, no hint cache, and past-incident search only sees live incidents that were
+  solved and confirmed before the replay time.
+- The tool-result cache is keyed by the replay time, so live and replayed results never mix.
+
+`tests/test_backtest.py` checks this with fake backends that return future data on purpose.
+
+Backtests are stored with `mode = 'backtest'`. They never join a live alert storm, never post to
+Slack, can't be confirmed, and are left out of `/stats` (shown under `backtests`), the answer
+cache, past-incident search and `/investigations/latest/report`.
+
+Limits: the replay can only see what Grafana Loki and Prometheus still keep (retention), plus
+deploys in `state/deploys.json`. If an earlier incident just before the replayed one isn't
+recorded in Loki's database, its leftover errors aren't cut off and can skew the rule-based suspects.
+
 ## Useful endpoints
 
 - `localhost:8088/investigations`: all investigations, with status, steps and cost
@@ -75,6 +124,7 @@ Loki has to find a different kind of cause.
 - `localhost:8088/investigations/<id>/trace`: every tool call Loki made
 - `POST localhost:8088/investigations/<id>/reject`: mark a report wrong (optional body `{"reason": "..."}`)
 - `localhost:8088/incidents`: alerts and which investigation they joined
+- `POST localhost:8088/backtest`: replay a past incident (see Backtesting)
 - `localhost:3000`: Grafana (Explore → Loki for logs)
 
 ## Settings
