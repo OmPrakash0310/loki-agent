@@ -1,0 +1,93 @@
+x-app-logging: &app-labels
+  labels: { logging: promtail }  # tells Promtail to collect this container's logs
+
+services:
+  # ---------- the demo app (what breaks) ----------
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: shop }
+    volumes: [./db/init.sql:/docker-entrypoint-initdb.d/init.sql]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app", "-d", "shop"]
+      interval: 2s
+      retries: 20
+
+  payments-svc:
+    build: ./services/payments-svc
+    <<: *app-labels
+    environment: { DATABASE_URL: postgresql://app:app@postgres:5432/shop }
+    ports: ["8002:8000"]
+    depends_on: { postgres: { condition: service_healthy } }
+
+  shop-api:
+    build: ./services/shop-api
+    <<: *app-labels
+    environment: { PAYMENTS_URL: http://payments-svc:8000 }
+    ports: ["8001:8000"]
+    depends_on: [payments-svc]
+
+  loadgen:
+    build: ./services/loadgen
+    depends_on: [shop-api]
+
+  # ---------- observability (what notices) ----------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml
+    ports: ["9090:9090"]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    volumes: [./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml]
+    ports: ["9093:9093"]
+
+  loki:
+    image: grafana/loki:3.0.0
+    ports: ["3100:3100"]
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./observability/promtail.yml:/etc/promtail/config.yml
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on: [loki]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes: [./observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/ds.yml]
+    ports: ["3000:3000"]
+
+  # ---------- the incident agent (what investigates) ----------
+  agent:
+    build: ./agent
+    <<: *app-labels
+    environment:
+      DATABASE_URL: postgresql://app:app@postgres:5432/agent
+      LOKI_URL: http://loki:3100
+      PROM_URL: http://prometheus:9090
+      DEPLOYS_FILE: /state/deploys.json
+      # Read from .env in this folder (never committed). See README.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      LOKI_MODEL: ${LOKI_MODEL:-claude-haiku-4-5}
+      LOKI_ESCALATE_MODEL: ${LOKI_ESCALATE_MODEL:-}
+      LOKI_ESCALATE_BELOW: ${LOKI_ESCALATE_BELOW:-0.6}
+      LOKI_MAX_STEPS: ${LOKI_MAX_STEPS:-8}
+      LOKI_MAX_COST_USD: ${LOKI_MAX_COST_USD:-0.10}
+      LOKI_DAILY_BUDGET_USD: ${LOKI_DAILY_BUDGET_USD:-1.00}
+      # Point at Ollama on your Mac to use a free local model (see .env.example).
+      # Its own name, so a shell's ANTHROPIC_BASE_URL can't switch Loki into local mode.
+      LOKI_OLLAMA_URL: ${LOKI_OLLAMA_URL:-}
+    volumes:
+      - ./state:/state:ro   # deploy history, read-only
+    ports: ["8088:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      loki: { condition: service_started }
+      prometheus: { condition: service_started }

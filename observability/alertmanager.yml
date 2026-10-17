@@ -1,0 +1,12 @@
+route:
+  receiver: incident-agent
+  group_by: [alertname, service]  # one notification per alert+service (dedupe)
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: incident-agent
+    webhook_configs:
+      - url: http://agent:8080/alerts  # the "doorbell"
+        send_resolved: true

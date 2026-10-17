@@ -1,0 +1,357 @@
+"""Loki's investigator: a Claude tool-use loop that finds the root cause of an incident.
+
+Built to spend as little as possible:
+1. Exact cache: a confirmed answer for the same incident (same fingerprint and
+   suspect deploy) is reused for $0.
+2. Hint cache: an earlier answer for a similar incident goes into the briefing,
+   so the model can confirm it in a step or two.
+3. The briefing already ranks suspects with plain code, so the model verifies
+   instead of searching.
+4. A cheap model by default, hard budgets per investigation and per day, and a
+   step limit. Every model call's tokens and cost are logged.
+"""
+import json
+import logging
+import os
+from datetime import timedelta
+from types import SimpleNamespace
+
+import anthropic
+import httpx
+
+import context
+import db
+import tools
+
+log = logging.getLogger("agent")
+
+MODEL = os.environ.get("LOKI_MODEL", "claude-haiku-4-5")
+# Optional: re-run with a stronger model when the cheap one is unsure. Off unless set.
+ESCALATE_MODEL = os.environ.get("LOKI_ESCALATE_MODEL", "")
+ESCALATE_BELOW = float(os.environ.get("LOKI_ESCALATE_BELOW", "0.6"))
+MAX_STEPS = int(os.environ.get("LOKI_MAX_STEPS", "8"))
+MAX_COST_USD = float(os.environ.get("LOKI_MAX_COST_USD", "0.10"))  # per investigation
+DAILY_BUDGET_USD = float(os.environ.get("LOKI_DAILY_BUDGET_USD", "1.00"))
+CACHE_TTL_DAYS = 7
+# Set LOKI_OLLAMA_URL to a local Ollama server (it speaks the same API) to run
+# open-source models for free. Claude-only features are switched off there.
+OLLAMA_URL = os.environ.get("LOKI_OLLAMA_URL", "")
+LOCAL = bool(OLLAMA_URL)
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+# USD per million tokens: input, output, cache write, cache read.
+PRICES = {
+    "claude-opus-5": (5.0, 25.0, 6.25, 0.5),
+    "claude-sonnet-5": (2.0, 10.0, 2.5, 0.2),
+    "claude-haiku-4-5": (1.0, 5.0, 1.25, 0.1),
+}
+
+SYSTEM = """You are Loki, an on-call engineer investigating a live production incident.
+
+You get a briefing with the alerts, a before-and-after of key metrics, the most common error log \
+patterns, recent deploys, and suspects ranked by simple rules. Find the root cause: the one change \
+or failure that started everything, not the symptoms it caused downstream.
+
+How to work:
+- Start from the top suspect and try to confirm or rule it out with the fewest tool calls. The \
+ranking is a heuristic; overturn it when the evidence says so.
+- Alerts on several services often share a single cause. A service reporting failures calling \
+another service is usually a victim, not the cause.
+- A deploy is only the cause if its change explains the errors. Read its diff and match the change \
+to the error lines. Timing alone is not proof.
+- Not every incident is a deploy. Slow responses with no matching code change point to a database, \
+a dependency, or load; check dependency latency.
+- Every link in your causal chain needs evidence from a tool result or the briefing. Don't propose a \
+mechanism (connection pools, memory leaks, cache effects) that no evidence shows.
+- Evidence must come from this incident's time window. Errors that stopped before this incident began, \
+and deploys that were already replaced or reverted, belong to earlier incidents and are not the cause.
+- If the briefing includes a similar past incident, check whether the same cause applies now \
+before reusing its conclusion.
+- You have read-only access. A human acts on your report.
+
+When you have enough evidence, call submit_report once. Only state facts you saw in the briefing or \
+a tool result, and quote specific numbers and log lines. Set confidence honestly: lower it when the \
+evidence is thin or two causes fit equally well. Most incidents need 2 to 5 tool calls."""
+
+
+class BudgetExceeded(Exception):
+    pass
+
+
+# ---------- model calls ----------
+
+def _price(model: str):
+    if LOCAL or model == "fake":
+        return (0, 0, 0, 0)
+    return PRICES.get(model, PRICES["claude-opus-5"])
+
+
+def _cost(model: str, usage) -> tuple[float, int, int]:
+    p_in, p_out, p_write, p_read = _price(model)
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    cost = (usage.input_tokens * p_in + usage.output_tokens * p_out + cache_write * p_write + cache_read * p_read) / 1e6
+    return cost, cache_read, cache_write
+
+
+def _call(client, model: str, messages: list):
+    if model == "fake":
+        return _fake_response(messages)
+    if LOCAL:
+        # Local open-source model through Ollama: plain request, no Claude-only extras.
+        return client.messages.create(model=model, max_tokens=8000, system=SYSTEM, tools=tools.TOOLS, messages=messages)
+    if model.startswith("claude-haiku"):
+        # Haiku 4.5: no effort setting and no server-side fallbacks. Caching kicks in
+        # once the prompt passes Haiku's 4,096-token minimum (later steps).
+        return client.messages.create(
+            model=model, max_tokens=8000, system=SYSTEM, tools=tools.TOOLS, messages=messages,
+            cache_control={"type": "ephemeral"},
+        )
+    # Opus/Sonnet: adaptive thinking is on by default. fallbacks="default" re-runs a
+    # request on Anthropic's recommended model if the safety classifiers decline it.
+    return client.beta.messages.create(
+        model=model, max_tokens=16000, system=SYSTEM, tools=tools.TOOLS, messages=messages,
+        cache_control={"type": "ephemeral"},
+        output_config={"effort": "high"},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+    )
+
+
+# ---------- fake model: tests the whole pipeline for $0 ----------
+
+_fake_state: dict[int, dict] = {}
+
+
+def _fake_response(messages: list):
+    """A scripted 'model' that follows the rule-based suspects. No API calls."""
+    key = id(messages)
+    state = _fake_state.setdefault(key, {"step": 0, "suspects": _fake_state.get("next_suspects", [])})
+    state["step"] += 1
+    top = state["suspects"][0] if state["suspects"] else {"kind": "non-deploy", "service": "unknown"}
+
+    def tool_use(name, args):
+        return SimpleNamespace(type="tool_use", id=f"fake_{state['step']}_{name}", name=name, input=args)
+
+    if state["step"] == 1:
+        block = tool_use("recent_deploys", {"minutes": 60})
+    elif state["step"] == 2 and top["kind"] == "deploy":
+        block = tool_use("git_diff", {"deploy_id": top["deploy_id"]})
+    else:
+        is_deploy = top["kind"] == "deploy"
+        block = tool_use("submit_report", {
+            "summary": f"[fake model] {top['service']} looks like the source" + (f" after deploy {top['deploy_id']}" if is_deploy else ""),
+            "root_cause": "Fake-model report built from the rule-based suspects; for pipeline testing only.",
+            "root_cause_service": top["service"],
+            "trigger": "deploy" if is_deploy else "unknown",
+            "deploy_id": top.get("deploy_id", ""),
+            "affected_services": [top["service"]],
+            "evidence": top.get("reasons", []),
+            "ruled_out": [],
+            "confidence": 0.5,
+            "suggested_action": "rollback" if is_deploy else "escalate",
+            "action_detail": "Pipeline test only.",
+        })
+    usage = SimpleNamespace(input_tokens=0, output_tokens=0, cache_creation_input_tokens=0, cache_read_input_tokens=0)
+    return SimpleNamespace(content=[block], stop_reason="tool_use", stop_details=None, usage=usage)
+
+
+# ---------- the loop ----------
+
+def _trace(conn, inv_id: int, step: int, tool: str, args, output: str, model=None, usage=None, cost=None):
+    cost_info = _cost(model, usage) if usage is not None else (None, None, None)
+    conn.execute(
+        "INSERT INTO trace_steps (investigation_id, step, tool, input, output, model, input_tokens, output_tokens, "
+        "cache_read_tokens, cache_write_tokens, cost_usd) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (inv_id, step, tool, json.dumps(args), output[:20000], model,
+         getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None),
+         cost_info[1], cost_info[2], cost),
+    )
+
+
+def _spent_today(conn) -> float:
+    row = conn.execute(
+        "SELECT coalesce(sum(cost_usd), 0) AS spent FROM investigations WHERE created_at >= date_trunc('day', now())"
+    ).fetchone()
+    return float(row["spent"])
+
+
+def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing, budget: float):
+    """Investigate with one model. Returns (report, steps, tokens_in, tokens_out, cost)."""
+    if model == "fake":
+        _fake_state["next_suspects"] = briefing.suspects
+    messages = [{"role": "user", "content": briefing.text}]
+    report, steps, tokens_in, tokens_out, cost = None, 0, 0, 0, 0.0
+
+    while report is None:
+        steps += 1
+        last_chance = steps >= MAX_STEPS or cost >= budget * 0.7
+        if steps > MAX_STEPS or cost >= budget:
+            raise BudgetExceeded(f"stopped at step {steps - 1}, ${cost:.4f} spent (limit ${budget:.2f}, {MAX_STEPS} steps)")
+        if last_chance:
+            messages.append({"role": "user", "content": "You're at your step or budget limit. Call submit_report now "
+                             "with what you have, and lower confidence to match the evidence."})
+
+        resp = _call(client, model, messages)
+        call_cost = _cost(model, resp.usage)[0]
+        tokens_in += resp.usage.input_tokens
+        tokens_out += resp.usage.output_tokens
+        cost += call_cost
+        _trace(conn, inv_id, steps, "llm", {}, f"stop_reason={resp.stop_reason}", model, resp.usage, round(call_cost, 5))
+
+        if resp.stop_reason == "refusal":
+            raise RuntimeError(f"model declined: {resp.stop_details}")
+        messages.append({"role": "assistant", "content": resp.content})
+
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_uses:
+            messages.append({"role": "user", "content": "Call submit_report with your conclusion."})
+            continue
+
+        results = []
+        for tu in tool_uses:
+            if tu.name == "submit_report":
+                report = tu.input
+                _trace(conn, inv_id, steps, tu.name, tu.input, "report submitted")
+                continue
+            output, is_error = tools.run(tu.name, tu.input)
+            _trace(conn, inv_id, steps, tu.name, tu.input, output)
+            log.info("investigation #%s step %d: %s(%s)", inv_id, steps, tu.name, json.dumps(tu.input))
+            results.append({"type": "tool_result", "tool_use_id": tu.id, "content": output, "is_error": is_error})
+        if report is None:
+            messages.append({"role": "user", "content": results})
+
+    _fake_state.pop(id(messages), None)
+    return report, steps, tokens_in, tokens_out, cost
+
+
+def investigate(inv_id: int) -> None:
+    with db.connect() as conn:
+        if _spent_today(conn) >= DAILY_BUDGET_USD:
+            conn.execute(
+                "UPDATE investigations SET status = 'skipped', finished_at = now(), error = %s WHERE id = %s",
+                (f"daily budget of ${DAILY_BUDGET_USD:.2f} reached", inv_id),
+            )
+            log.warning("investigation #%s skipped: daily budget reached", inv_id)
+            return
+
+        conn.execute("UPDATE investigations SET status = 'running', model = %s WHERE id = %s", (MODEL, inv_id))
+        incidents = conn.execute(
+            "SELECT * FROM incidents WHERE investigation_id = %s ORDER BY started_at", (inv_id,)
+        ).fetchall()
+        # Scope to this incident: start after the previous incident was resolved (but never
+        # later than 90s before this alert, since errors begin before an alert fires).
+        first_alert = min(i["started_at"] for i in incidents)
+        prev = conn.execute(
+            "SELECT max(resolved_at) AS t FROM incidents WHERE resolved_at <= %s "
+            "AND investigation_id IS DISTINCT FROM %s",
+            (first_alert, inv_id),
+        ).fetchone()["t"]
+        floor = min(prev, first_alert - timedelta(seconds=90)) if prev else None
+        tools.set_window_floor(floor)
+        briefing = context.build(incidents, floor)
+        conn.execute(
+            "UPDATE investigations SET fingerprint = %s, cache_key = %s WHERE id = %s",
+            (briefing.fingerprint, briefing.exact_key, inv_id),
+        )
+        log.warning("investigation #%s: %d alert(s), fingerprint %s", inv_id, len(incidents), briefing.exact_key)
+
+        # 1. Exact cache: a confirmed answer for this same incident costs nothing.
+        cached = conn.execute(
+            "SELECT * FROM report_cache WHERE exact_key = %s AND confirmed AND expires_at > now()",
+            (briefing.exact_key,),
+        ).fetchone()
+        if cached:
+            conn.execute("UPDATE report_cache SET hits = hits + 1 WHERE exact_key = %s", (briefing.exact_key,))
+            report = dict(cached["report"])
+            report["summary"] = f"[Matched confirmed incident #{cached['investigation_id']}] {report['summary']}"
+            conn.execute(
+                "UPDATE investigations SET status = 'done', finished_at = now(), report = %s, steps = 0, "
+                "cache_hit = %s, model = 'cache' WHERE id = %s",
+                (json.dumps(report), f"exact:{cached['investigation_id']}", inv_id),
+            )
+            _trace(conn, inv_id, 0, "cache", {"exact_key": briefing.exact_key}, f"reused confirmed #{cached['investigation_id']}")
+            _finish(inv_id, report, 0, 0.0)
+            return
+
+        # 2. Hint cache: a similar earlier incident becomes a lead in the briefing.
+        similar = conn.execute(
+            # Only human-confirmed answers become hints: an unconfirmed (possibly wrong)
+            # answer would otherwise reinforce its own mistake next time.
+            "SELECT * FROM report_cache WHERE fingerprint = %s AND confirmed AND expires_at > now() "
+            "ORDER BY created_at DESC LIMIT 1",
+            (briefing.fingerprint,),
+        ).fetchone()
+        cache_hit = None
+        if similar:
+            r = similar["report"]
+            briefing.text += (
+                f"\n\n## Similar past incident #{similar['investigation_id']} (confirmed by a human)\n"
+                f"- Root cause then: {r['root_cause']}\n- Action then: {r['suggested_action']}: {r['action_detail']}\n"
+                "Check whether the same cause applies now; don't assume it."
+            )
+            cache_hit = f"hint:{similar['investigation_id']}"
+        _trace(conn, inv_id, 0, "briefing", {"fingerprint": briefing.exact_key, "cache": cache_hit}, briefing.text)
+
+        # 3. Investigate with the cheap model; escalate only if it's unsure and budget allows.
+        # Ollama ignores the key but the SDK needs one.
+        client = (anthropic.Anthropic(api_key="ollama", base_url=OLLAMA_URL) if LOCAL
+                  else None if MODEL == "fake" else anthropic.Anthropic())
+        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, MODEL, briefing, MAX_COST_USD)
+        model_used = MODEL
+        if ESCALATE_MODEL and report["confidence"] < ESCALATE_BELOW and cost < MAX_COST_USD:
+            log.warning("investigation #%s: confidence %.2f, escalating to %s", inv_id, report["confidence"], ESCALATE_MODEL)
+            strong = anthropic.Anthropic()
+            report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, MAX_COST_USD - cost)
+            steps, t_in, t_out, cost, model_used = steps + s2, t_in + i2, t_out + o2, cost + c2, f"{MODEL}+{ESCALATE_MODEL}"
+
+        conn.execute(
+            "UPDATE investigations SET status = 'done', finished_at = now(), report = %s, steps = %s, input_tokens = %s, "
+            "output_tokens = %s, cost_usd = %s, model = %s, cache_hit = %s WHERE id = %s",
+            (json.dumps(report), steps, t_in, t_out, round(cost, 4), model_used, cache_hit, inv_id),
+        )
+        # Remember the answer. It's reused as-is only after a human confirms it (POST /investigations/<id>/confirm).
+        conn.execute(
+            "INSERT INTO report_cache (exact_key, fingerprint, investigation_id, report, expires_at) "
+            "VALUES (%s, %s, %s, %s, now() + make_interval(days => %s)) "
+            # Never overwrite an answer a human confirmed.
+            "ON CONFLICT (exact_key) DO UPDATE SET investigation_id = EXCLUDED.investigation_id, report = EXCLUDED.report, "
+            "created_at = now(), expires_at = EXCLUDED.expires_at WHERE NOT report_cache.confirmed",
+            (briefing.exact_key, briefing.fingerprint, inv_id, json.dumps(report), CACHE_TTL_DAYS),
+        )
+    _finish(inv_id, report, steps, cost)
+
+
+def _finish(inv_id: int, report: dict, steps: int, cost: float):
+    text = render(inv_id, report, steps, cost)
+    log.warning("investigation #%s done\n%s", inv_id, text)
+    post_to_slack(text)
+
+
+def render(inv_id: int, r: dict, steps: int, cost: float) -> str:
+    lines = [
+        f"*Loki · Incident #{inv_id}*  ({r['trigger']}, confidence {r['confidence']:.0%})",
+        f"*{r['summary']}*",
+        "",
+        f"*Root cause* ({r['root_cause_service']}" + (f", deploy {r['deploy_id']}" if r.get("deploy_id") else "") + f"): {r['root_cause']}",
+        "",
+        "*Evidence*",
+        *[f"• {e}" for e in r["evidence"]],
+    ]
+    if r.get("ruled_out"):
+        lines += ["", "*Ruled out*", *[f"• {e}" for e in r["ruled_out"]]]
+    lines += [
+        "",
+        f"*Suggested action: {r['suggested_action']}*. {r['action_detail']}",
+        f"_Affected: {', '.join(r['affected_services'])} · {steps} steps · ${cost:.4f} · not verified by reproduction yet_",
+    ]
+    return "\n".join(lines)
+
+
+def post_to_slack(text: str) -> None:
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        httpx.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10).raise_for_status()
+    except httpx.HTTPError as e:
+        log.error("slack post failed: %s", e)
