@@ -14,6 +14,8 @@ import time
 import httpx
 from fastapi import HTTPException
 
+import verifier
+
 log = logging.getLogger("agent")
 
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -45,14 +47,23 @@ def _section(text: str) -> dict:
     return {"type": "section", "text": {"type": "mrkdwn", "text": _cap(text, 3000)}}
 
 
+def _verification(v: dict | None) -> list[dict]:
+    """The reproduction verdict, when there is one (see verifier.py)."""
+    if not v:
+        return []
+    lines = [f"• {_esc(e)}" for e in v.get("evidence", [])[:MAX_EVIDENCE]]
+    return [_section("\n".join([f"*Verification:* {_esc(verifier.headline(v))}", *lines]))]
+
+
 def build_blocks(inv_id: int, r: dict, steps: int, cost: float) -> list[dict]:
     header = f"Incident #{inv_id} · {r['trigger']} · {r['confidence']:.0%} confidence"
     cause_where = f"`{_esc(r['root_cause_service'])}`" + (f", deploy `{_esc(r['deploy_id'])}`" if r.get("deploy_id") else "")
     evidence = [f"• {_esc(e)}" for e in r["evidence"][:MAX_EVIDENCE]]
     if len(r["evidence"]) > MAX_EVIDENCE:
         evidence.append(f"_…and {len(r['evidence']) - MAX_EVIDENCE} more in the full report_")
+    v = r.get("verification")
     footer = (f"Affected: {_esc(', '.join(r['affected_services']))} · {steps} steps · ${cost:.4f} · "
-              "not verified by reproduction yet")
+              f"{verifier.label(v)}")
 
     buttons = [
         {"type": "button", "action_id": CONFIRM, "style": "primary", "value": str(inv_id),
@@ -69,6 +80,7 @@ def build_blocks(inv_id: int, r: dict, steps: int, cost: float) -> list[dict]:
         _section(f"*{_esc(r['summary'])}*"),
         _section(f"*Root cause* ({cause_where})\n{_esc(r['root_cause'])}"),
         _section("*Evidence*\n" + "\n".join(evidence)),
+        *_verification(v),
         _section(f"*Suggested action:* {_esc(r['suggested_action'])}\n{_esc(r['action_detail'])}"),
         {"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]},
         {"type": "actions", "block_id": FEEDBACK_BLOCK, "elements": buttons},
