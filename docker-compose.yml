@@ -103,6 +103,9 @@ services:
       SENTRY_ORG: ${SENTRY_ORG:-}
       SENTRY_PROJECTS: ${SENTRY_PROJECTS:-}
       SENTRY_BASE_URL: ${SENTRY_BASE_URL:-}
+      # Alert intake (README "Connecting your alerts"). Empty = signatures not checked.
+      SENTRY_WEBHOOK_SECRET: ${SENTRY_WEBHOOK_SECRET:-}
+      PAGERDUTY_WEBHOOK_SECRET: ${PAGERDUTY_WEBHOOK_SECRET:-}
     volumes:
       - ./state:/state:ro   # deploy history, read-only
     ports: ["8088:8080"]
