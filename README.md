@@ -30,6 +30,11 @@ Inside `agent/`:
 | `sources/` | Pluggable deploy and error sources: JSON file, Grafana Loki, GitHub, Sentry |
 | `redact.py` | Removes secrets and personal data before anything reaches the model |
 
+## Deploying for a customer (pilot)
+
+One Loki per customer on a small VPS, with HTTPS, auth, backups and upgrades: see
+[`deploy/PILOT_RUNBOOK.md`](deploy/PILOT_RUNBOOK.md) (`deploy/install.sh`, `loki doctor`).
+
 ## Run it
 
 1. Add your Anthropic API key:

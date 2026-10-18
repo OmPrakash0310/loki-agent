@@ -22,7 +22,7 @@ from fastapi import HTTPException, Request
 log = logging.getLogger("agent")
 
 # Paths that need no API key. /slack/interactions checks Slack's signature instead.
-PUBLIC_PATHS = {"/health", "/slack/interactions"}
+PUBLIC_PATHS = {"/health", "/health/ready", "/slack/interactions"}
 # Any path under this prefix also accepts LOKI_WEBHOOK_TOKEN as ?token=.
 WEBHOOK_PREFIX = "/alerts"
 # GET /share/trace/{id} needs no API key but must carry a valid signed ?exp=&sig=

@@ -10,12 +10,13 @@ from datetime import datetime
 from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 import auth
 import backtest
 import db
+import selfmon
 import intake
 import investigator
 import lessons
@@ -49,6 +50,7 @@ def startup():
             "UPDATE investigations SET status = 'failed', finished_at = now(), error = 'agent restarted mid-investigation' "
             "WHERE status IN ('queued', 'running') RETURNING id"
         ).fetchall()
+    selfmon.start()
     if orphaned:
         log.warning("marked %d orphaned investigation(s) as failed: %s", len(orphaned), [r["id"] for r in orphaned])
 
@@ -182,6 +184,15 @@ def manual_investigation(req: ManualRequest, request: Request):
 def health():
     """Liveness probe. Public, so it returns no data."""
     return {"ok": True}
+
+
+@app.get("/health/ready")
+def health_ready():
+    """Readiness: database reachable and background worker alive. Public, booleans only."""
+    ready, checks = selfmon.readiness()
+    if not ready:
+        return JSONResponse({"ok": False, **checks}, status_code=503)
+    return {"ok": True, **checks}
 
 
 @app.get("/incidents")

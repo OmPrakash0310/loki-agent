@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Operator CLI, installed as /usr/local/bin/loki.
+#   loki doctor [--offline|--show-token]   setup checks (inside the agent container)
+#   loki status | logs [svc] | restart     compose shortcuts
+#   loki backup | restore <file> | upgrade <version>
+#   loki urls                              webhook URLs with the token
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+# Installed as a symlink to /opt/loki/loki, so `here` is LOKI_HOME.
+# shellcheck source=deploy/lib.sh
+source "$here/lib.sh"
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  doctor)  compose exec -T agent python doctor.py "$@" ;;
+  urls)    compose exec -T agent python doctor.py --offline --show-token | sed -n '/^Webhook URLs:/,/^$/p' ;;
+  status)  compose ps ;;
+  logs)    compose logs --tail 200 -f "$@" ;;
+  restart) compose up -d ;;
+  backup)  "$here/backup.sh" ;;
+  restore) "$here/restore.sh" "$@" ;;
+  upgrade) "$here/upgrade.sh" "$@" ;;
+  *) sed -n '2,7p' "$0" ;;
+esac

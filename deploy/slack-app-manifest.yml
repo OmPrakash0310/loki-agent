@@ -1,0 +1,21 @@
+# Slack app for one Loki pilot. api.slack.com/apps -> Create New App -> From a manifest.
+# Replace loki.customer.example.com with LOKI_DOMAIN. One app per customer workspace.
+display_information:
+  name: Loki
+  description: AI incident investigator (read-only). Posts root-cause reports with confirm/reject buttons.
+  background_color: "#1f2937"
+features:
+  bot_user:
+    display_name: loki
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write          # post reports; the only scope Loki needs
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://loki.customer.example.com/slack/interactions
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

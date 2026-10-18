@@ -1,0 +1,91 @@
+# Loki pilot: one customer per VPS. Agent + Postgres + Caddy (HTTPS). No demo services.
+# Run through the `loki` wrapper or:  docker compose --env-file loki.env up -d
+# Every setting comes from loki.env (chmod 600, written by install.sh). See .env.template.
+name: ${COMPOSE_PROJECT_NAME:-loki}
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }   # log rotation: at most 50 MB per container
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: loki
+      POSTGRES_DB: loki
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in loki.env}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "loki", "-d", "loki"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy: { resources: { limits: { memory: 512m, cpus: "1.0" } } }
+    networks: [internal]
+    <<: *logging
+
+  agent:
+    image: ${LOKI_IMAGE:-ghcr.io/turbotrade-tt/loki-agent}:${LOKI_VERSION:?set LOKI_VERSION in loki.env}
+    restart: unless-stopped
+    env_file: [loki.env]
+    environment:
+      DATABASE_URL: postgresql://loki:${POSTGRES_PASSWORD}@postgres:5432/loki
+      LOKI_REQUIRE_AUTH: "1"                  # never start open, whatever loki.env says
+      LOKI_VERIFY: ${LOKI_VERIFY:-0}          # needs a Docker socket; off for pilots
+      LOKI_PROBES: ${LOKI_PROBES:-0}
+      LOKI_PROM_URL: ${LOKI_PROM_URL:-}       # the CUSTOMER's Prometheus; empty = none
+      LOKI_URL: ${LOKI_URL:-}                 # the CUSTOMER's Grafana Loki (logs)
+      DEPLOYS_FILE: /nonexistent/deploys.json # pilots use LOKI_DEPLOYS_SOURCE=github
+    expose: ["8080"]                          # no host port: only Caddy reaches it
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    depends_on: { postgres: { condition: service_healthy } }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    deploy: { resources: { limits: { memory: 768m, cpus: "1.0" } } }
+    networks: [internal, egress]   # egress: the customer's telemetry, GitHub, Sentry, model API
+    <<: *logging
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    environment:
+      LOKI_DOMAIN: ${LOKI_DOMAIN:?set LOKI_DOMAIN in loki.env}
+      LOKI_ACME_EMAIL: ${LOKI_ACME_EMAIL:?set LOKI_ACME_EMAIL in loki.env}
+    ports:
+      - "${LOKI_HTTP_PORT:-80}:80"
+      - "${LOKI_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./caddy/${LOKI_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      - ./caddy/loki_routes.caddy:/etc/caddy/loki_routes.caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    depends_on: { agent: { condition: service_healthy } }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy: { resources: { limits: { memory: 128m, cpus: "0.5" } } }
+    networks: [internal, public]
+    <<: *logging
+
+networks:
+  internal: { internal: true }   # postgres <-> agent <-> caddy; no route to the internet
+  egress: {}                     # agent outbound only (no published ports)
+  public: {}                     # caddy, ports 80/443
+
+volumes:
+  pgdata: {}
+  caddy_data: {}
+  caddy_config: {}

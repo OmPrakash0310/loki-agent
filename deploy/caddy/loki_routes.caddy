@@ -1,0 +1,34 @@
+# Shared by Caddyfile and Caddyfile.local. Only Loki's own routes are proxied.
+(loki_routes) {
+	request_body {
+		max_size 1MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		Permissions-Policy "interest-cohort=()"
+		-Server
+	}
+	@loki path /health /health/ready /alerts /alerts/* /investigations /investigations/* /incidents /stats /deploys/* /slack/interactions /lessons /lessons/* /backtest /backtest/* /share/*
+	handle @loki {
+		reverse_proxy agent:8080
+	}
+	handle {
+		respond "Not found" 404
+	}
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					replace token REDACTED
+				}
+				request>headers>Authorization delete
+			}
+		}
+	}
+}
