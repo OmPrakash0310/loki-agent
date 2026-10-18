@@ -8,6 +8,8 @@ Everything returned here is compact and redacted, ready to show the model.
 import contextvars
 import os
 import re
+import threading
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -15,11 +17,17 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 import logparse
+import metrics_config
 import sources
 from redact import redact
 
 LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100")
-PROM_URL = os.environ.get("PROM_URL", "http://prometheus:9090")
+# LOKI_PROM_URL wins when set. Set it to empty (or "off") for a stack without
+# Prometheus: the briefing then uses logs, errors and deploys only.
+PROM_URL = (os.environ["LOKI_PROM_URL"].strip() if "LOKI_PROM_URL" in os.environ
+            else os.environ.get("PROM_URL", "http://prometheus:9090"))
+if PROM_URL.lower() in ("off", "none"):
+    PROM_URL = ""
 DEPLOYS_FILE = os.environ.get("DEPLOYS_FILE", "/state/deploys.json")
 
 # Keep log lines that report a problem, plus exception summaries such as
@@ -93,7 +101,8 @@ def _hms(t: datetime) -> str:
 
 def fetch_logs(service: str | None, start: datetime, end: datetime, errors_only: bool, limit: int = 5000):
     # Loki never investigates its own logs.
-    selector = f'{{service="{service}"}}' if service else '{service=~".+", service!="agent"}'
+    cfg = metrics_config.current()
+    selector = cfg.log_selector(service)
     query = selector + (" " + ERROR_FILTER if errors_only else "")
     end = _cap(end)
     if start >= end:
@@ -106,7 +115,7 @@ def fetch_logs(service: str | None, start: datetime, end: datetime, errors_only:
     resp.raise_for_status()
     lines = []
     for stream in resp.json()["data"]["result"]:
-        svc = stream["stream"].get("service", "?")
+        svc = stream["stream"].get(cfg.log_service_label, "?")
         for ts, line in stream["values"]:
             lines.append((datetime.fromtimestamp(int(ts) / 1e9, timezone.utc), svc, line))
     lines.sort(key=lambda x: x[0])
@@ -206,16 +215,75 @@ def _render(c) -> dict:
 
 # ---------- metrics ----------
 
-METRICS = {
-    "error_rate": (
-        '(sum(rate(http_requests_total{{service="{s}",status=~"5.."}}[1m])) or vector(0))'
-        ' / sum(rate(http_requests_total{{service="{s}"}}[1m]))'
-    ),
-    "p95_latency_seconds": (
-        'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{{service="{s}"}}[1m])))'
-    ),
-    "request_rate": 'sum(rate(http_requests_total{{service="{s}"}}[1m]))',
-}
+# The metrics the briefing and query_metrics offer. Their PromQL comes from
+# metrics_config (LOKI_METRICS_PRESET / LOKI_METRICS_CONFIG); the defaults are the demo's.
+METRICS = metrics_config.METRIC_NAMES
+
+
+def prom_enabled() -> bool:
+    return bool(PROM_URL)
+
+
+def _cfg() -> metrics_config.MetricsConfig:
+    return metrics_config.current()
+
+
+# Which metric families exist in Prometheus, looked up once and cached. A lookup
+# that fails (old Prometheus, a compatible backend without the API) counts as
+# "assume present", so the queries run and simply return no data as before.
+NAMES_TTL_S = 300
+_names_cache: dict[str, tuple[float, frozenset | None]] = {}
+_names_lock = threading.Lock()
+
+
+def _metric_names() -> frozenset | None:
+    with _names_lock:
+        hit = _names_cache.get(PROM_URL)
+        if hit and time.monotonic() - hit[0] < NAMES_TTL_S:
+            return hit[1]
+    try:
+        resp = httpx.get(f"{PROM_URL}/api/v1/label/__name__/values", timeout=10)
+        resp.raise_for_status()
+        names = frozenset(resp.json()["data"])
+    except Exception:
+        names = None
+    with _names_lock:
+        _names_cache[PROM_URL] = (time.monotonic(), names)
+    return names
+
+
+def reset_metric_cache() -> None:
+    with _names_lock:
+        _names_cache.clear()
+
+
+def _family_missing(series: str | None, what: str) -> str | None:
+    if not prom_enabled():
+        return "no Prometheus configured (LOKI_PROM_URL is empty)"
+    if not series:
+        return f"no {what} metric configured"
+    names = _metric_names()
+    if names is not None and series not in names:
+        return f"no {what} metric found ({series} is not in Prometheus)"
+    return None
+
+
+def metric_unavailable(metric: str) -> str | None:
+    """Why `metric` can't be queried here (not configured, not in Prometheus, no Prometheus), or None."""
+    cfg = _cfg()
+    if not prom_enabled():
+        return "no Prometheus configured (LOKI_PROM_URL is empty)"
+    reason = cfg.missing_reason(metric)
+    if reason:
+        return reason
+    fam = cfg.families()
+    if metric == "p95_latency_seconds":
+        return _family_missing(fam["latency"], "latency")
+    return _family_missing(fam["requests"], "request counter")
+
+
+def dependency_unavailable() -> str | None:
+    return _family_missing(_cfg().families()["dependency"], "dependency latency")
 
 
 def _label_window() -> dict:
@@ -225,13 +293,20 @@ def _label_window() -> dict:
 
 
 def services() -> list[str]:
-    resp = httpx.get(f"{PROM_URL}/api/v1/label/service/values", params=_label_window(), timeout=10)
+    if not prom_enabled():
+        return []
+    cfg = _cfg()
+    match = cfg.services_match()
+    params = {"match[]": match, **_label_window()} if match else _label_window()
+    resp = httpx.get(f"{PROM_URL}/api/v1/label/{cfg.service_label}/values", params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()["data"]
 
 
 def metric_series(metric: str, service: str, start: datetime, end: datetime, step_s: int = 30):
-    query = METRICS[metric].format(s=service)
+    if metric_unavailable(metric):
+        return []
+    query = _cfg().promql(metric, service)
     end = _cap(end)
     if start > end:
         return []
@@ -263,10 +338,12 @@ def metric_before(metric: str, service: str, at: datetime):
 
 
 def metric_at(metric: str, service: str, at: datetime):
+    if metric_unavailable(metric):
+        return None
     at = _cap(at)
     resp = httpx.get(
         f"{PROM_URL}/api/v1/query",
-        params={"query": METRICS[metric].format(s=service), "time": at.timestamp()},
+        params={"query": _cfg().promql(metric, service), "time": at.timestamp()},
         timeout=10,
     )
     resp.raise_for_status()
@@ -277,45 +354,48 @@ def metric_at(metric: str, service: str, at: datetime):
     return None if v != v else round(v, 4)
 
 
-DEPENDENCY_P95 = (
-    'histogram_quantile(0.95, sum by (le, dependency) '
-    '(rate(dependency_duration_seconds_bucket{{service="{s}"}}[1m])))'
-)
-
-
 def dependency_p95_at(service: str, at: datetime) -> dict[str, float]:
     """p95 latency of each dependency (database, external APIs) a service calls."""
+    if dependency_unavailable():
+        return {}
+    cfg = _cfg()
     at = _cap(at)
-    resp = httpx.get(f"{PROM_URL}/api/v1/query", params={"query": DEPENDENCY_P95.format(s=service), "time": at.timestamp()}, timeout=10)
+    resp = httpx.get(f"{PROM_URL}/api/v1/query", params={"query": cfg.dependency_promql(service), "time": at.timestamp()}, timeout=10)
     resp.raise_for_status()
     out = {}
     for r in resp.json()["data"]["result"]:
         v = float(r["value"][1])
         if v == v:
-            out[r["metric"].get("dependency", "?")] = round(v, 4)
+            out[r["metric"].get(cfg.dependency_label, "?")] = round(v, 4)
     return out
 
 
 def dependency_p95_series(service: str, start: datetime, end: datetime, step_s: int = 30) -> dict[str, list]:
+    if dependency_unavailable():
+        return {}
+    cfg = _cfg()
     end = _cap(end)
     if start > end:
         return {}
     resp = httpx.get(
         f"{PROM_URL}/api/v1/query_range",
-        params={"query": DEPENDENCY_P95.format(s=service), "start": start.timestamp(), "end": end.timestamp(), "step": step_s},
+        params={"query": cfg.dependency_promql(service), "start": start.timestamp(), "end": end.timestamp(), "step": step_s},
         timeout=20,
     )
     resp.raise_for_status()
     out = {}
     for r in resp.json()["data"]["result"]:
         pts = [(datetime.fromtimestamp(float(t), timezone.utc), round(float(v), 4)) for t, v in r["values"] if float(v) == float(v)]
-        out[r["metric"].get("dependency", "?")] = _not_future(pts)
+        out[r["metric"].get(cfg.dependency_label, "?")] = _not_future(pts)
     return out
 
 
 def services_with_dependencies() -> list[str]:
-    resp = httpx.get(f"{PROM_URL}/api/v1/label/service/values",
-                     params={"match[]": "dependency_duration_seconds_count", **_label_window()}, timeout=10)
+    if dependency_unavailable():
+        return []
+    cfg = _cfg()
+    resp = httpx.get(f"{PROM_URL}/api/v1/label/{cfg.service_label}/values",
+                     params={"match[]": f"{cfg.dependency_histogram}_count", **_label_window()}, timeout=10)
     resp.raise_for_status()
     return resp.json()["data"]
 

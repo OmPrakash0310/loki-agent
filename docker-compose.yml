@@ -106,6 +106,12 @@ services:
       # Alert intake (README "Connecting your alerts"). Empty = signatures not checked.
       SENTRY_WEBHOOK_SECRET: ${SENTRY_WEBHOOK_SECRET:-}
       PAGERDUTY_WEBHOOK_SECRET: ${PAGERDUTY_WEBHOOK_SECRET:-}
+      # Metric and log label names (see README "Using your own metrics"). Empty = the demo's.
+      LOKI_METRICS_PRESET: ${LOKI_METRICS_PRESET:-}
+      LOKI_METRICS_CONFIG: ${LOKI_METRICS_CONFIG:-}
+      # No colon on purpose: unset keeps the demo Prometheus, LOKI_PROM_URL= (empty) in .env
+      # means "no Prometheus" (logs + errors + deploys only).
+      LOKI_PROM_URL: ${LOKI_PROM_URL-http://prometheus:9090}
     volumes:
       - ./state:/state:ro   # deploy history, read-only
     ports: ["8088:8080"]
