@@ -5,6 +5,11 @@ Usage: python3 chaos.py bad_deploy | slow_db | timeout | none
 bad_deploy also records a deploy in state/deploys.json, the way a real CI
 system would, so Loki can find it in the deploy history. slow_db and timeout
 leave no deploy: those failures come from the database and a dependency.
+
+Each deploy names the image it shipped (loki-demo/payments-svc:<version>), so
+Loki's verifier can run that exact version in a sandbox. Build the images with
+scripts/build_payments_images.sh. The running demo itself is switched over the
+/chaos endpoint, so no redeploy is needed.
 """
 import json
 import secrets
@@ -14,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEPLOYS = Path(__file__).parent / "state" / "deploys.json"
+IMAGE = "loki-demo/payments-svc"
 
 BAD_DIFF = """--- a/payments-svc/charge.py
 +++ b/payments-svc/charge.py
@@ -39,6 +45,7 @@ def record_deploy(version: str, message: str, diff: str) -> str:
         "author": "ravi",
         "message": message,
         "deployed_at": datetime.now(timezone.utc).isoformat(),
+        "image": f"{IMAGE}:{version}",
         "diff": diff,
     })
     DEPLOYS.write_text(json.dumps(deploys, indent=2) + "\n")
