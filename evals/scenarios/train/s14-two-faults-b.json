@@ -1,0 +1,90 @@
+{
+  "id": "s14-two-faults-b",
+  "description": "Two independent faults: slow database + NULL-price product.",
+  "difficulty": "hard",
+  "split": "train",
+  "fault_types": [
+    "data_issue",
+    "multi_fault",
+    "slow_db"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "payments-svc",
+      "fault": "slow_db",
+      "params": {
+        "seconds": 1.5
+      }
+    },
+    {
+      "at_s": 30,
+      "action": "fault",
+      "service": "shop-api",
+      "fault": "bad_product",
+      "params": {
+        "product_id": 1
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "postgres",
+    "cause_type": "slow_db",
+    "triggers": [
+      "infrastructure",
+      "dependency"
+    ],
+    "deploy_ref": null,
+    "acceptable_services": [
+      "postgres",
+      {
+        "service": "payments-svc",
+        "if_text_any": [
+          "postgres",
+          "database",
+          " db"
+        ]
+      }
+    ],
+    "trap": "two independent faults at once; naming either one (with its evidence) counts",
+    "keywords_any": [
+      "postgres",
+      "database",
+      "db"
+    ],
+    "alternatives": [
+      {
+        "root_cause_service": "shop-api",
+        "cause_type": "data_issue",
+        "triggers": [
+          "unknown",
+          "infrastructure"
+        ],
+        "deploy_ref": null,
+        "acceptable_services": [
+          "shop-api"
+        ],
+        "trap": "",
+        "keywords_any": [
+          "coffee",
+          "price",
+          "null",
+          "none"
+        ]
+      }
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "two-faults",
+    "seed": 1,
+    "variant": 1
+  }
+}

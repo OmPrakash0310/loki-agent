@@ -1,0 +1,58 @@
+{
+  "id": "s08-card-hang-a",
+  "description": "The card network hangs 5s: shop-api times out calling payments-svc.",
+  "difficulty": "easy",
+  "split": "train",
+  "fault_types": [
+    "dependency_hang",
+    "downstream_timeout"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "payments-svc",
+      "fault": "card_hang",
+      "params": {
+        "seconds": 5
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "card-network",
+    "cause_type": "dependency_hang",
+    "triggers": [
+      "dependency",
+      "infrastructure"
+    ],
+    "deploy_ref": null,
+    "acceptable_services": [
+      "card-network",
+      {
+        "service": "payments-svc",
+        "if_text_any": [
+          "card"
+        ]
+      }
+    ],
+    "trap": "shop-api's timeouts name payments-svc; the hang is one hop further down",
+    "keywords_any": [
+      "card"
+    ],
+    "trap_services": [
+      "shop-api"
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "card-hang",
+    "seed": 1,
+    "variant": 0
+  }
+}

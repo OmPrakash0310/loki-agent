@@ -1,0 +1,73 @@
+{
+  "id": "s04-shop-config-timeout-a",
+  "description": "Config deploy sets shop-api's payments timeout to 0.02s (meant ms vs s): orders time out.",
+  "difficulty": "hard",
+  "split": "train",
+  "fault_types": [
+    "config_error",
+    "upstream_blame_trap"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [
+    {
+      "ref": "d1",
+      "service": "shop-api",
+      "version": "v1.18.4",
+      "author": "lena",
+      "message": "config: align timeouts with SLO doc",
+      "kind": "config",
+      "diff": "--- a/shop-api/config/production.env\n+++ b/shop-api/config/production.env\n@@ -2,4 +2,4 @@\n PAYMENTS_URL=http://payments-svc:8000\n-PAYMENTS_TIMEOUT_S=2.0\n+PAYMENTS_TIMEOUT_S=0.02\n LOG_LEVEL=info\n",
+      "culprit": true
+    }
+  ],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "deploy",
+      "ref": "d1"
+    },
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "shop-api",
+      "fault": "payments_timeout_config",
+      "params": {
+        "timeout_s": 0.02
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "shop-api",
+    "cause_type": "config_error",
+    "triggers": [
+      "deploy"
+    ],
+    "deploy_ref": "d1",
+    "acceptable_services": [
+      "shop-api"
+    ],
+    "trap": "errors read 'timeout calling payments-svc' though payments is healthy",
+    "keywords_any": [
+      "timeout",
+      "config"
+    ],
+    "actions_any": [
+      "rollback",
+      "fix_forward"
+    ],
+    "trap_services": [
+      "payments-svc",
+      "card-network"
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "shop-config-timeout",
+    "seed": 1,
+    "variant": 0
+  }
+}
