@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS feedback_investigation ON feedback (investigation_id);
+-- Write actions (confirm, reject, backtest): which API key or Slack user, and when.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id SERIAL PRIMARY KEY,
+    actor TEXT NOT NULL,    -- API key name, slack:<user>, webhook, or anonymous (dev mode)
+    action TEXT NOT NULL,
+    investigation_id INT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
