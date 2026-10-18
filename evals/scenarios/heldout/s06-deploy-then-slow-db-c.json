@@ -1,0 +1,78 @@
+{
+  "id": "s06-deploy-then-slow-db-c",
+  "description": "A harmless payments-svc deploy ('Bump structlog and tidy log formatting'), then 45s later Postgres slows down (1.5s).",
+  "difficulty": "hard",
+  "split": "heldout",
+  "fault_types": [
+    "slow_db",
+    "timing_trap"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [
+    {
+      "ref": "d0",
+      "service": "payments-svc",
+      "version": "v2.9.3",
+      "author": "ravi",
+      "message": "Bump structlog and tidy log formatting",
+      "kind": "code",
+      "diff": "--- a/payments-svc/requirements.txt\n+++ b/payments-svc/requirements.txt\n@@ -3,4 +3,4 @@\n psycopg[binary]==3.2.3\n-structlog==24.1.0\n+structlog==24.4.0\n prometheus-client==0.21.0\n",
+      "culprit": false
+    }
+  ],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "deploy",
+      "ref": "d0"
+    },
+    {
+      "at_s": 45,
+      "action": "fault",
+      "service": "payments-svc",
+      "fault": "slow_db",
+      "params": {
+        "seconds": 1.5
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "postgres",
+    "cause_type": "slow_db",
+    "triggers": [
+      "infrastructure",
+      "dependency"
+    ],
+    "deploy_ref": null,
+    "acceptable_services": [
+      "postgres",
+      {
+        "service": "payments-svc",
+        "if_text_any": [
+          "postgres",
+          "database",
+          " db"
+        ]
+      }
+    ],
+    "trap": "a deploy to the failing service just before the slowdown; the ranking rules score it highest",
+    "keywords_any": [
+      "postgres",
+      "database",
+      "db"
+    ],
+    "trap_deploy_refs": [
+      "d0"
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "deploy-then-slow-db",
+    "seed": 1,
+    "variant": 2
+  }
+}

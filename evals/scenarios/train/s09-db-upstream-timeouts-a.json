@@ -1,0 +1,62 @@
+{
+  "id": "s09-db-upstream-timeouts-a",
+  "description": "Postgres takes 3.0s, longer than shop-api's 2s payments timeout: shop-api reports timeouts.",
+  "difficulty": "medium",
+  "split": "train",
+  "fault_types": [
+    "downstream_timeout",
+    "slow_db"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "payments-svc",
+      "fault": "slow_db",
+      "params": {
+        "seconds": 3.0
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "postgres",
+    "cause_type": "slow_db",
+    "triggers": [
+      "infrastructure",
+      "dependency"
+    ],
+    "deploy_ref": null,
+    "acceptable_services": [
+      "postgres",
+      {
+        "service": "payments-svc",
+        "if_text_any": [
+          "postgres",
+          "database",
+          " db"
+        ]
+      }
+    ],
+    "trap": "the only error lines are shop-api timeouts",
+    "keywords_any": [
+      "postgres",
+      "database",
+      "db"
+    ],
+    "trap_services": [
+      "shop-api"
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "db-upstream-timeouts",
+    "seed": 1,
+    "variant": 0
+  }
+}

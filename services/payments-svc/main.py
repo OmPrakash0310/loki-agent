@@ -8,10 +8,13 @@ It also has a hidden /chaos endpoint so we can break the running service on
 purpose without a redeploy. The chaos mode is deliberately NOT logged, so the
 agent has to find the cause from symptoms, just like a real incident.
 """
+import hashlib
 import json
 import logging
 import os
+import random
 import re
+import threading
 import time
 
 import psycopg
@@ -42,8 +45,20 @@ DEPENDENCY = Histogram(
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
 )
 
-# Current failure mode: none | bad_deploy | slow_db | timeout
+# Current failure mode: none | bad_deploy | slow_db | timeout (the original three),
+# plus any number of composable faults with parameters (scripts/scenario_spec.py lists them).
+# Hot paths only test membership in SWITCHES and index FAULTS inline, so no fault name or
+# parameter ever lands in a request handler's locals (live probes capture locals).
 CHAOS = {"mode": "none"}
+FAULTS: dict = {}
+SWITCHES: set = set()
+# Card network authorization errors seen by the client library.
+class CardNetworkError(Exception):
+    pass
+
+
+# Receipts are cached for idempotent retries. (The leak fault turns eviction off.)
+_receipts: list = []
 
 
 class Charge(BaseModel):
@@ -52,7 +67,8 @@ class Charge(BaseModel):
 
 
 class ChaosMode(BaseModel):
-    mode: str
+    mode: str | None = None
+    faults: dict | None = None
 
 
 @app.post("/charge")
@@ -69,10 +85,30 @@ def charge(body: Charge):
         currency = payload["currency"]  # KeyError -> 500
         amount = payload["amount"] * FX_RATES[currency]
 
+    # Risk scoring (v2.6.0): large charges get a score from 0-1.
+    if "risk_regression" in SWITCHES and amount >= FAULTS["risk_regression"].get("min_amount", 1000):
+        score = amount / 1000  # bug: never normalized
+        if score > 1:
+            raise ValueError(f"risk score out of range: {score:.3f}")
+
+    # Idempotency: keep recent receipts and check the new charge against them.
+    # Old receipts are evicted; the mem_leak fault stops eviction (up to max_mb).
+    if "mem_leak" not in SWITCHES:
+        _receipts.append(bytearray(64))
+        del _receipts[:-100]
+    elif sum(map(len, _receipts)) < 1048576 * FAULTS["mem_leak"].get("max_mb", 300):
+        _receipts.append(bytearray(1024 * FAULTS["mem_leak"].get("kb_per_request", 64)))
+    for receipt in _receipts:  # checksum scan: gets slower as the cache grows
+        hashlib.sha1(receipt).digest()
+
     # Authorize with the card network (simulated; normally ~30ms).
     with DEPENDENCY.labels("payments-svc", "card-network").time():
         # In "timeout" mode the card network hangs.
-        time.sleep(5 if CHAOS["mode"] == "timeout" else 0.03)
+        time.sleep(5 if CHAOS["mode"] == "timeout" else
+                   FAULTS["card_hang"].get("seconds", 5) if "card_hang" in SWITCHES else 0.03)
+        if "card_errors" in SWITCHES and random.random() < FAULTS["card_errors"].get("rate", 1.0):
+            raise CardNetworkError(f"card network returned {FAULTS['card_errors'].get('status', 503)} "
+                                   "Service Unavailable (authorize)")
 
     # The timer covers connecting too: when the database is struggling, the wait
     # often happens while opening the connection, not in the query.
@@ -80,6 +116,8 @@ def charge(body: Charge):
         if CHAOS["mode"] == "slow_db":
             # Simulates a missing index / lock: every query takes 1.5s.
             conn.execute("SELECT pg_sleep(1.5)")
+        elif "slow_db" in SWITCHES and random.random() < FAULTS["slow_db"].get("rate", 1.0):
+            conn.execute("SELECT pg_sleep(%s)", (FAULTS["slow_db"].get("seconds", 1.5),))
         conn.execute(
             "INSERT INTO payments (order_id, amount) VALUES (%s, %s)",
             (body.order_id, amount),
@@ -140,7 +178,7 @@ class FailedRequestSampler:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] != "http" or scope["path"] == "/chaos":
             return await self.app(scope, receive, send)
         chunks, status = [], [200]
 
@@ -179,8 +217,33 @@ if mount_probes and mount_probes(app):
 
 @app.post("/chaos")
 def set_chaos(body: ChaosMode):
-    CHAOS["mode"] = body.mode
-    return CHAOS
+    # {"mode": X} keeps the original behaviour; "none" also clears every fault.
+    # {"faults": {name: params}} replaces the composable fault set.
+    if body.mode is not None:
+        CHAOS["mode"] = body.mode
+        if body.mode == "none":
+            FAULTS.clear()
+    if body.faults is not None:
+        FAULTS.clear()
+        FAULTS.update({k: dict(v or {}, since=time.monotonic()) for k, v in body.faults.items()})
+    _refresh()
+    return {"mode": CHAOS["mode"], "faults": sorted(FAULTS)}
+
+
+def _refresh():
+    """Recompute which faults are on now. A fault with flap_s is on and off in turns."""
+    SWITCHES.clear()
+    SWITCHES.update(k for k, v in FAULTS.items()
+                    if not v.get("flap_s") or int((time.monotonic() - v["since"]) // v["flap_s"]) % 2 == 0)
+
+
+def _refresher():
+    while True:
+        time.sleep(0.25)
+        _refresh()
+
+
+threading.Thread(target=_refresher, daemon=True).start()
 
 
 @app.get("/health")

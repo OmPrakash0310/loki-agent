@@ -1,0 +1,72 @@
+{
+  "id": "s15-log-noise-b",
+  "description": "5 unrelated error lines per request in shop-api hide a real payments-side fault.",
+  "difficulty": "hard",
+  "split": "train",
+  "fault_types": [
+    "downstream_timeout",
+    "log_noise",
+    "slow_db"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "shop-api",
+      "fault": "log_flood",
+      "params": {
+        "lines_per_request": 5
+      }
+    },
+    {
+      "at_s": 20,
+      "action": "fault",
+      "service": "payments-svc",
+      "fault": "slow_db",
+      "params": {
+        "seconds": 2.5
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "postgres",
+    "cause_type": "slow_db",
+    "triggers": [
+      "infrastructure",
+      "dependency"
+    ],
+    "deploy_ref": null,
+    "acceptable_services": [
+      "postgres",
+      {
+        "service": "payments-svc",
+        "if_text_any": [
+          "postgres",
+          "database",
+          " db"
+        ]
+      }
+    ],
+    "trap": "shop-api floods unrelated analytics / recs-cache errors",
+    "keywords_any": [
+      "postgres",
+      "database",
+      "db"
+    ],
+    "trap_services": [
+      "shop-api"
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "log-noise",
+    "seed": 1,
+    "variant": 1
+  }
+}

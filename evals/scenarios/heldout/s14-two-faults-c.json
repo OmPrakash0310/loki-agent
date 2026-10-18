@@ -1,0 +1,85 @@
+{
+  "id": "s14-two-faults-c",
+  "description": "Two independent faults: bad_product + card 503s.",
+  "difficulty": "hard",
+  "split": "heldout",
+  "fault_types": [
+    "data_issue",
+    "dependency_errors",
+    "multi_fault"
+  ],
+  "load": {
+    "shape": "steady",
+    "extra_rps": 0,
+    "duration_s": 0
+  },
+  "deploys": [],
+  "steps": [
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "shop-api",
+      "fault": "bad_product",
+      "params": {
+        "product_id": 1
+      }
+    },
+    {
+      "at_s": 0,
+      "action": "fault",
+      "service": "payments-svc",
+      "fault": "card_errors",
+      "params": {
+        "rate": 0.5
+      }
+    }
+  ],
+  "ground_truth": {
+    "root_cause_service": "card-network",
+    "cause_type": "dependency_errors",
+    "triggers": [
+      "dependency"
+    ],
+    "deploy_ref": null,
+    "acceptable_services": [
+      "card-network",
+      {
+        "service": "payments-svc",
+        "if_text_any": [
+          "card"
+        ]
+      }
+    ],
+    "trap": "two independent faults at once; naming either one (with its evidence) counts",
+    "keywords_any": [
+      "card"
+    ],
+    "alternatives": [
+      {
+        "root_cause_service": "shop-api",
+        "cause_type": "data_issue",
+        "triggers": [
+          "unknown",
+          "infrastructure"
+        ],
+        "deploy_ref": null,
+        "acceptable_services": [
+          "shop-api"
+        ],
+        "trap": "",
+        "keywords_any": [
+          "coffee",
+          "price",
+          "null",
+          "none"
+        ]
+      }
+    ]
+  },
+  "generator": {
+    "mode": "template",
+    "template": "two-faults",
+    "seed": 1,
+    "variant": 2
+  }
+}
