@@ -24,6 +24,7 @@ Inside `agent/`:
 | `tools.py` | Read-only tools Claude can call: logs, metrics, deploys, diffs, past incidents |
 | `investigator.py` | The model loop: caches, budgets, step limit, cost logging, report |
 | `telemetry.py` | Talks to Grafana Loki, Prometheus and the deploy history |
+| `metrics_config.py` | Which metric and log label names to query (presets, `LOKI_METRICS_CONFIG`) |
 | `slack.py` | Slack reports with Confirm / Wrong / View trace buttons |
 | `verifier.py` | Proves a blamed deploy by reproducing the failure in a sandbox (see Verification) |
 | `sources/` | Pluggable deploy and error sources: JSON file, Grafana Loki, GitHub, Sentry |
@@ -497,7 +498,7 @@ related alerts before it begins.
 By default Loki reads the demo stack: deploys from `state/deploys.json` and
 errors from Grafana Loki. To investigate a real team's stack, point it at
 GitHub (deploy history and diffs) and/or Sentry (errors) instead. Metrics
-still come from Prometheus (`PROM_URL`). Everything is read-only, and all text
+still come from Prometheus (`PROM_URL`; see "Using your own metrics"). Everything is read-only, and all text
 from these sources goes through `redact.py` before the model sees it.
 
 | Variable | Default | Meaning |
@@ -550,3 +551,69 @@ Run the tests (no Docker, no network):
 python3.12 -m venv .venv && .venv/bin/pip install httpx==0.27.2 pytest
 .venv/bin/pytest tests
 ```
+
+## Using your own metrics
+
+The demo's services export `http_requests_total{service, status}`,
+`http_request_duration_seconds` and `dependency_duration_seconds{service, dependency}`,
+and Promtail labels their logs `service`. A real stack names things differently, so
+every PromQL and LogQL query Loki sends is built from a small config
+(`agent/metrics_config.py`). With nothing set, the queries are exactly the demo's.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOKI_METRICS_PRESET` | `default` | `default`, `otel`, `spring` or `express-prom` (below) |
+| `LOKI_METRICS_CONFIG` | | Path to a JSON file (YAML if PyYAML is installed) overriding single fields |
+| `LOKI_PROM_URL` | `PROM_URL` | Prometheus to query. Set it to empty (or `off`) when there is no Prometheus |
+
+| Preset | Service label | Status label | Requests | Latency histogram | Dependency histogram | Log label |
+|---|---|---|---|---|---|---|
+| `default` | `service` | `status` | `http_requests_total` | `http_request_duration_seconds` | `dependency_duration_seconds` (`dependency`) | `service` |
+| `otel` | `service_name` | `http_response_status_code` | `http_server_request_duration_seconds_count` | `http_server_request_duration_seconds` | `http_client_request_duration_seconds` (`server_address`) | `service_name` |
+| `spring` | `application` | `status` | `http_server_requests_seconds_count` | `http_server_requests_seconds` | `http_client_requests_seconds` (`client_name`) | `application` |
+| `express-prom` | `job` | `status_code` | `http_request_duration_seconds_count` | `http_request_duration_seconds` | none | `job` |
+
+- `otel`: OpenTelemetry semantic conventions as exported to Prometheus with resource
+  attributes turned into labels (`service_name`). Grafana Loki 3 sets `service_name` on logs.
+- `spring`: Micrometer. Latency needs `management.metrics.distribution.percentiles-histogram.http.server.requests=true`;
+  `application` comes from `management.metrics.tags.application`. Use `"service_label": "job"` if you don't set it.
+- `express-prom`: prom-client through `express-prom-bundle`, which has no service label of
+  its own, so the scrape `job` names the service.
+
+A config file overrides a preset field by field (`null` turns a metric off):
+
+```json
+{"preset": "spring", "service_label": "job", "status_5xx": "5..", "dependency_histogram": null,
+ "log_service_label": "app"}
+```
+
+Fields: `service_label`, `status_label`, `status_5xx` (regex), `requests` (a counter or a
+histogram's `_count`), `latency_histogram` and `dependency_histogram` (base names, without
+`_bucket`), `dependency_label`, `log_service_label`, `self_service` (Loki's own logs, never
+investigated), `services_from_requests` (list services from the request metric only, so
+unrelated scrape jobs don't show up; on in every preset except `default`). In Docker,
+mount the file into the agent container and give its path there.
+
+**Find your names.** Point the discovery helper at your Prometheus. It only sends GET
+requests, lists candidate request counters, latency histograms and their labels, names
+the closest preset and prints a config to start from:
+
+```bash
+.venv/bin/python scripts/discover_metrics.py --prom http://localhost:9090
+.venv/bin/python scripts/discover_metrics.py --prom http://prom:9090 --json > metrics.json
+```
+
+**Missing metrics.** Loki asks Prometheus once which metric names exist (cached for 5
+minutes). A metric that isn't configured or isn't there is skipped in the briefing with a
+note (for example `p95_latency_seconds skipped: no latency metric found`), and
+`query_metrics` / `query_dependencies` answer with that note instead of failing. If the
+name lookup itself fails, Loki assumes the metrics exist and queries as before.
+
+**No Prometheus.** With `LOKI_PROM_URL` set to empty, the briefing is built from logs,
+errors and deploys only, and says so.
+
+**Limitations.** One service label for every metric (no per-metric relabeling); the
+status regex must match how your label spells codes (`5..` fits `500`, not `5xx`; use
+`"status_5xx": "5.*"` for that); the presets are written from the projects' documented
+defaults and checked with mocked Prometheus responses, not yet against live
+OpenTelemetry, Spring or Express services.

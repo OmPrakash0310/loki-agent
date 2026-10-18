@@ -133,9 +133,17 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
         out.append(f"- {tm._hms(i['started_at'])} {i['alert_name']} on {i['service']} ({i['severity']}): {i['summary']}")
 
     out += ["", "## Metrics: typical value before the first alert -> now"]
-    for svc in tm.services():
+    # A metric this stack doesn't have is skipped with a note, not shown as "no data".
+    missing = {m: tm.metric_unavailable(m) for m in tm.METRICS}
+    metrics = [m for m in tm.METRICS if not missing[m]]
+    if not tm.prom_enabled():
+        out.append("- skipped: no Prometheus configured (LOKI_PROM_URL is empty); "
+                   "this briefing uses logs, errors and deploys only")
+    else:
+        out += [f"- note: {m} skipped: {why}" for m, why in missing.items() if why]
+    for svc in tm.services() if metrics else []:
         row = []
-        for metric in ("error_rate", "p95_latency_seconds", "request_rate"):
+        for metric in metrics:
             b, n = tm.metric_before(metric, svc, before), tm.metric_at(metric, svc, end)
             row.append(f"{metric} {'no data' if b is None else b} -> {'no data' if n is None else n}")
         out.append(f"- {svc}: " + "; ".join(row))
@@ -151,6 +159,9 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
             # A spike: 4x slower than before, or over 1s when there's no baseline to compare with.
             if nv is not None and ((bv is not None and nv > 0.25 and nv > bv * 4) or (bv is None and nv > 1.0)):
                 dep_spikes.append({"service": svc, "dependency": dep, "before": bv, "now": nv})
+    dep_missing = tm.dependency_unavailable() if tm.prom_enabled() else None
+    if dep_missing:
+        out += ["", "## Dependency latency", f"- skipped: {dep_missing}"]
     if dep_lines:
         out += ["", "## Dependency latency (calls from a service to its database / external APIs): before -> now", *dep_lines]
 

@@ -142,6 +142,9 @@ def query_logs(service=None, contains=None, minutes=20, errors_only=True):
 def query_metrics(metric, service, minutes=20):
     if metric not in tm.METRICS:
         raise ValueError(f"unknown metric {metric!r}; use one of {list(tm.METRICS)}")
+    missing = tm.metric_unavailable(metric)
+    if missing:  # a clear answer the model can act on, not a failure
+        return {"service": service, "metric": metric, "points": [], "note": f"{metric} is not available: {missing}"}
     m = _clip(minutes, 20, 120)
     points = tm.metric_series(metric, service, _since(m), tm.now())
     if not points:
@@ -213,6 +216,9 @@ def _since(minutes: int) -> datetime:
 
 
 def query_dependencies(service, minutes=20):
+    missing = tm.dependency_unavailable()
+    if missing:
+        return {"service": service, "dependencies": {}, "note": f"dependency latency is not available: {missing}"}
     m = _clip(minutes, 20, 120)
     series = tm.dependency_p95_series(service, _since(m), tm.now())
     if not series:
