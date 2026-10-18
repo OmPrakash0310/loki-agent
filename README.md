@@ -329,6 +329,32 @@ are refused with 401.
 Note: `LOKI_PUBLIC_URL` exposes the agent's read endpoints (traces include log
 lines) to whoever can reach that URL. Put it behind your VPN or an auth proxy.
 
+## Supported languages
+
+Loki's log condensing understands error output from **Python**, **Java/JVM**
+(including Spring Boot), **Node.js/TypeScript** and **Go**, in plain text or as
+JSON (pino, winston, zap, logrus). The Grafana Loki filter keeps the lines that
+say what went wrong (exception summaries, `Caused by:` chains, Go panics, JSON
+lines at error level) and drops stack frames. Stack traces are then folded back
+into one event, grouped by their deepest cause, and the first frame in your own
+code (not `java.*`, Spring, `node_modules`, the Go runtime or `site-packages`)
+is shown as the location:
+
+```
+x312 in payments-svc: TypeError: Cannot read properties of undefined (reading 'currency') [at src/charge.ts:42]
+```
+
+Request ids, UUIDs, hex addresses, Java object hashes and durations don't split
+patterns. Pattern keys for the Python demo are unchanged, so earlier confirmed
+answers still match.
+
+Limitations: the location needs the frames, so it appears when a trace reaches
+Loki as one entry (JSON loggers, or Promtail/Alloy `multiline` stage) or when
+`query_logs` reads full logs; with one entry per line, error-only queries show
+the error without a location. Traces from two requests of the same service that
+interleave line by line can be folded together. Other languages still work
+as before, as plain error lines.
+
 ## Integrations
 
 By default Loki reads the demo stack: deploys from `state/deploys.json` and

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import logparse
 import sources
 from redact import redact
 
@@ -22,12 +23,20 @@ PROM_URL = os.environ.get("PROM_URL", "http://prometheus:9090")
 DEPLOYS_FILE = os.environ.get("DEPLOYS_FILE", "/state/deploys.json")
 
 # Keep log lines that report a problem, plus exception summaries such as
-# "KeyError: 'currency'". Skip stack-frame lines ("File ..., line 51"), which
-# would otherwise drown out the one line that matters. Backticks = raw string.
+# "KeyError: 'currency'" or "java.lang.IllegalStateException: ...", "Caused by:"
+# chains, Go panics and JSON lines logged at error level (pino 50/60, winston,
+# zap, logrus). Skip stack-frame lines (Python "File ..., line 51", Java/Node
+# "at ...", Go "goroutine 1 [running]:" and "/app/x.go:42 +0x1d"), which would
+# otherwise drown out the one line that matters. A summary must end in ":", " [" or
+# the line end, so Go frames like "main.handleError(...)" stay out.
+# One RE2 regex (no lookarounds, no backreferences) in a backtick raw string.
 ERROR_FILTER = (
-    "|~ `(?i)(^\\S*\\d{4}-\\d\\d-\\d\\d.*(error|exception|failed|timeout|refused))"
-    "|(^(ERROR|CRITICAL|WARNING)\\b)"
-    "|(^[\\s|+]*[a-z_][\\w.]*(error|exception)\\b)`"
+    r"|~ `(?i)(^\S*\d{4}[-/]\d\d[-/]\d\d.*(error|exception|failed|timeout|refused|panic))"
+    r"|(^(ERROR|CRITICAL|WARNING)\b)"
+    r"|(^[\s|+]*([a-z_$][\w.$]*)?(error|exception|throwable)(:|\s*$|\s\[))"
+    r"|(^\s*(caused by:|\[cause\]:|exception in thread |panic: |fatal error: ))"
+    r"|(unhandledpromiserejection)"
+    r'|(\b(level|severity)"?\s*[:=]\s*"?(error|fatal|panic|dpanic|critical|50|60)\b)`'
 )
 
 
@@ -104,35 +113,95 @@ def fetch_logs(service: str | None, start: datetime, end: datetime, errors_only:
     return _not_future(lines)
 
 
+# Values that vary per request but don't make a different error. Each is replaced
+# before the generic digit rule below. None of them can fire on the Python demo's
+# lines, whose patterns (and so the answer-cache fingerprints) must not change:
+# tests/test_languages.py locks them.
+_VOLATILE = [
+    # request / trace ids: keep the key, drop the value
+    (re.compile(r"\b((?:req(?:uest)?|trace|span|correlation)[-_]?id)([\"']?\s*[=:]\s*[\"']?)[\w-]+", re.I), r"\1\2<id>"),
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<hex>"),  # Go/C addresses
+    (re.compile(r"(?<=[\w$])@[0-9a-f]{4,8}\b(?!\.\w)"), "@<hash>"),  # Java Object.toString(): Payment@1a2b3c4d
+    # prefixed ids and pod names: ord_9f8e7d2a, payments-7d9f8c6b5
+    (re.compile(r"\b[a-zA-Z]{2,8}[-_](?=[A-Za-z]*\d)[A-Za-z0-9]{6,}\b"), "<id>"),
+    (re.compile(r"\b(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))+\b"), "<dur>"),  # 250ms, 5.002s, 1m30s
+    # quoted data (tokens, ids, emails), not quoted names: 'currency' stays, so
+    # KeyError: 'currency' and KeyError: 'amount' remain different errors
+    (re.compile(r"""(["'])(?=[^"'\s]*(?:[A-Za-z][^"'\s]*\d|\d[^"'\s]*[A-Za-z]|@))[^"'\s]+\1|(["'])[^"'\s]{24,}\2"""), "'<v>'"),
+]
+
+
 def normalize(line: str) -> str:
     """Turn a log line into a pattern so identical errors group together."""
     line = re.sub(r"^[\s|+]+", "", line)  # exception-group indentation
-    line = re.sub(r"^\d{4}-\d\d-\d\d[ T][\d:,.]+\s*", "", line)  # leading timestamp
+    line = re.sub(r"^\d{4}[-/]\d\d[-/]\d\d[ T][\d:,.]+(?:Z|[+-]\d\d:?\d\d)?\s*", "", line)  # leading timestamp
+    for rx, repl in _VOLATILE:
+        line = rx.sub(repl, line)
     line = re.sub(r"\b[0-9a-f]{8,}\b", "<id>", line)
     line = re.sub(r"\d+(\.\d+)?", "<n>", line)
     return line.strip()[:220]
 
 
+def _event_view(ev, stream_lang):
+    """(pattern, example, extra keys) for one folded event.
+    A single plain line is handled exactly as before the language work."""
+    if len(ev.lines) == 1 and not (expanded := logparse.json_lines(ev.lines[0])):
+        line = ev.lines[0]
+        extra = {"language": stream_lang, "error_type": logparse.parse([line]).error_type}
+        return normalize(line), re.sub(r"^[\s|+]+", "", line), extra
+    lines = expanded if len(ev.lines) == 1 else ev.lines
+    p = logparse.parse(lines, python=ev.python)
+    lead = re.sub(r"^[\s|+]+", "", p.lead) if p.lead else None
+    parts = [lead] if lead else []
+    if p.outer and not (lead and p.outer.split(": ", 1)[-1] in lead):
+        parts.append(p.outer)
+    if p.root and p.root != p.outer:
+        parts.append(f"caused by {p.root}")
+    # Cap each part so a long logger header can't push the root cause out of the example.
+    example = " | ".join(x[:200] for x in parts) or ev.lines[0]
+    extra = {"language": logparse.detect_language(ev.lines) or stream_lang, "error_type": p.error_type,
+             "location": p.location, "root_cause": p.root}
+    return normalize(p.root or lead or ev.lines[0]), example, extra
+
+
 def cluster_logs(lines, top: int = 10):
-    clusters = defaultdict(lambda: {"count": 0, "services": set(), "first": None, "last": None, "example": ""})
-    for t, svc, line in lines:
-        c = clusters[normalize(line)]
+    """Group error lines into ranked patterns. Stack traces are folded into one event
+    first (any language), so a trace counts once and is keyed by its root cause."""
+    by_svc = defaultdict(list)
+    for _, svc, line in lines:
+        by_svc[svc].append(line)
+    stream_lang = {svc: logparse.detect_language(ls) for svc, ls in by_svc.items()}
+    clusters = defaultdict(lambda: {"count": 0, "services": set(), "first": None, "last": None, "example": "", "extra": {}})
+    for ev in logparse.fold(lines):
+        if all(not l.strip() or logparse.is_frame(l) for l in ev.lines):
+            continue  # stray frames or blank lines: no error of their own
+        pattern, example, extra = _event_view(ev, stream_lang[ev.svc])
+        c = clusters[pattern]
         c["count"] += 1
-        c["services"].add(svc)
-        c["first"] = c["first"] or t
-        c["last"] = t
-        c["example"] = line
+        c["services"].add(ev.svc)
+        c["first"] = c["first"] or ev.t
+        c["last"] = ev.t
+        c["example"] = example
+        # The latest event's details win, but a location seen once is kept: the trace
+        # that had frames says where, even if the latest line of the pattern didn't.
+        c["extra"].update({k: v for k, v in extra.items() if v})
     ranked = sorted(clusters.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top]
-    return [
-        {
-            "count": c["count"],
-            "services": sorted(c["services"]),
-            "first_seen": _hms(c["first"]),
-            "last_seen": _hms(c["last"]),
-            "example": redact(re.sub(r"^[\s|+]+", "", c["example"])[:400]),
-        }
-        for _, c in ranked
-    ]
+    return [_render(c) for _, c in ranked]
+
+
+def _render(c) -> dict:
+    loc = c["extra"].get("location")
+    suffix = f" [at {loc}]" if loc else ""
+    return {
+        "count": c["count"],
+        "services": sorted(c["services"]),
+        "first_seen": _hms(c["first"]),
+        "last_seen": _hms(c["last"]),
+        "example": redact(c["example"][:400 - len(suffix)] + suffix),
+        # optional: language, error_type, location ("src/charge.ts:42"), root_cause
+        **{k: redact(v) for k, v in c["extra"].items()},
+    }
 
 
 # ---------- metrics ----------

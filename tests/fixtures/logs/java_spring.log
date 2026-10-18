@@ -1,0 +1,30 @@
+2026-10-15T16:21:01.884Z  INFO 1 --- [nio-8080-exec-1] c.a.payments.ChargeController            : charging order=1041 requestId=7f3a9c2e-1b4d-4e8a-9c3f-2a1b0c9d8e7f
+2026-10-15T16:21:02.017Z ERROR 1 --- [nio-8080-exec-2] c.a.payments.ChargeController            : charge failed for order=1042 requestId=0b9e2c4d-5f6a-4b7c-8d9e-0f1a2b3c4d5e
+com.acme.payments.ChargeException: could not charge order 1042
+	at com.acme.payments.ChargeService.charge(ChargeService.java:57)
+	at com.acme.payments.ChargeController.charge(ChargeController.java:31)
+	at java.base/jdk.internal.reflect.DirectMethodHandleAccessor.invoke(DirectMethodHandleAccessor.java:103)
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885)
+	at java.base/java.lang.Thread.run(Thread.java:1583)
+Caused by: java.lang.IllegalStateException: currency missing for payment com.acme.payments.Payment@1a2b3c4d
+	at com.acme.payments.CurrencyResolver.resolve(CurrencyResolver.java:42)
+	at com.acme.payments.ChargeService.charge(ChargeService.java:54)
+	... 48 common frames omitted
+2026-10-15T16:21:02.019Z ERROR 1 --- [nio-8080-exec-2] o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed: com.acme.payments.ChargeException: could not charge order 1042] with root cause
+
+java.lang.IllegalStateException: currency missing for payment com.acme.payments.Payment@5e6f7a8b
+	at com.acme.payments.CurrencyResolver.resolve(CurrencyResolver.java:42)
+	at com.acme.payments.ChargeService.charge(ChargeService.java:54)
+	at org.springframework.web.servlet.FrameworkServlet.service(FrameworkServlet.java:885)
+2026-10-15T16:21:02.540Z  WARN 1 --- [nio-8080-exec-3] c.a.payments.LedgerClient                : ledger slow, retrying in 250ms
+Exception in thread "main" java.lang.IllegalStateException: Failed to execute CommandLineRunner
+	at org.springframework.boot.SpringApplication.callRunner(SpringApplication.java:791)
+	at com.acme.payments.PaymentsApplication.main(PaymentsApplication.java:12)
+Caused by: org.postgresql.util.PSQLException: Connection to postgres:5432 refused. Check that the hostname and port are correct and that the postmaster is accepting TCP/IP connections.
+	at org.postgresql.core.v3.ConnectionFactoryImpl.openConnectionImpl(ConnectionFactoryImpl.java:342)
+	at com.acme.payments.Migrations.run(Migrations.java:23)
+	... 5 more
+Caused by: java.net.ConnectException: Connection refused
+	at java.base/sun.nio.ch.Net.pollConnect(Native Method)
+	at org.postgresql.core.PGStream.createSocket(PGStream.java:243)
+	... 9 more
