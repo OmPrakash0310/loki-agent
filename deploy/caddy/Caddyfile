@@ -1,0 +1,10 @@
+# Production: automatic HTTPS (Let's Encrypt) for LOKI_DOMAIN. DNS must point here first.
+{
+	email {$LOKI_ACME_EMAIL}
+}
+
+import /etc/caddy/loki_routes.caddy
+
+{$LOKI_DOMAIN} {
+	import loki_routes
+}

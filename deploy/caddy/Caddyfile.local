@@ -1,0 +1,11 @@
+# Local testing only: Caddy's internal CA instead of Let's Encrypt (LOKI_CADDYFILE=Caddyfile.local).
+{
+	local_certs
+}
+
+import /etc/caddy/loki_routes.caddy
+
+{$LOKI_DOMAIN} {
+	tls internal
+	import loki_routes
+}
