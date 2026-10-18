@@ -1,0 +1,33 @@
+{"level":30,"time":1760545261884,"pid":1,"hostname":"payments-7d9f8c6b5-x2x9k","reqId":"req-1a","msg":"charging order 1041"}
+{"level":50,"time":1760545262017,"pid":1,"hostname":"payments-7d9f8c6b5-x2x9k","reqId":"req-1b","err":{"type":"TypeError","message":"Cannot read properties of undefined (reading 'currency')","stack":"TypeError: Cannot read properties of undefined (reading 'currency')\n    at charge (/app/src/charge.ts:42:15)\n    at /app/src/routes.ts:18:22\n    at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)"},"msg":"charge failed"}
+{"level":"error","message":"refund failed for order 1046","stack":"Error: connect ECONNREFUSED 10.0.0.5:5432\n    at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1595:16)","service":"payments-svc","timestamp":"2026-10-15T16:21:02.300Z"}
+/app/dist/charge.js:42
+    const currency = order.payment.currency;
+                                   ^
+
+TypeError: Cannot read properties of undefined (reading 'currency')
+    at charge (/app/src/charge.ts:42:15)
+    at /app/src/routes.ts:18:22
+    at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)
+    at next (/app/node_modules/express/lib/router/route.js:149:13)
+
+Node.js v20.11.1
+Error: charge failed for order 1044
+    at charge (/app/src/charge.ts:51:11)
+    at async /app/src/routes.ts:18:5 {
+  [cause]: Error: connect ECONNREFUSED 10.0.0.5:5432
+      at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1595:16) {
+    errno: -111,
+    code: 'ECONNREFUSED',
+    syscall: 'connect',
+    address: '10.0.0.5',
+    port: 5432
+  }
+}
+node:internal/process/promises:289
+            triggerUncaughtException(err, true /* fromPromise */);
+            ^
+
+[UnhandledPromiseRejection: This error originated either by throwing inside of an async function without a catch block, or by rejecting a promise which was not handled with .catch(). The promise rejected with the reason "ledger write failed for order 1043".] {
+  code: 'ERR_UNHANDLED_REJECTION'
+}
