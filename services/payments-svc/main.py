@@ -57,13 +57,14 @@ class ChaosMode(BaseModel):
 
 @app.post("/charge")
 def charge(body: Charge):
-    mode = CHAOS["mode"]
+    # The demo's fault switch is read from the global, never stored in a local:
+    # live probes capture locals, and the switch would give the answer away.
     payload = body.model_dump()
     amount = payload["amount"]
 
     # The live demo can switch the v2.5.0 code path on at runtime (bad_deploy),
     # so the running service breaks the same way the v2.5.0 image does.
-    if MULTI_CURRENCY or mode == "bad_deploy":
+    if MULTI_CURRENCY or CHAOS["mode"] == "bad_deploy":
         # Multi-currency: convert using the currency the shop sends (it sends none).
         currency = payload["currency"]  # KeyError -> 500
         amount = payload["amount"] * FX_RATES[currency]
@@ -71,12 +72,12 @@ def charge(body: Charge):
     # Authorize with the card network (simulated; normally ~30ms).
     with DEPENDENCY.labels("payments-svc", "card-network").time():
         # In "timeout" mode the card network hangs.
-        time.sleep(5 if mode == "timeout" else 0.03)
+        time.sleep(5 if CHAOS["mode"] == "timeout" else 0.03)
 
     # The timer covers connecting too: when the database is struggling, the wait
     # often happens while opening the connection, not in the query.
     with DEPENDENCY.labels("payments-svc", "postgres").time(), psycopg.connect(DB_URL) as conn:
-        if mode == "slow_db":
+        if CHAOS["mode"] == "slow_db":
             # Simulates a missing index / lock: every query takes 1.5s.
             conn.execute("SELECT pg_sleep(1.5)")
         conn.execute(
