@@ -123,7 +123,10 @@ async def receive_alerts(request: Request):
 
 @app.post("/alerts/grafana")
 async def receive_grafana(request: Request):
-    return _ingest(lambda p: intake.from_alertmanager(p, "grafana"), await _json(request))
+    body = await request.body()
+    if not intake.verify_grafana(body, request.headers):
+        raise HTTPException(401, "bad grafana signature")
+    return _ingest(lambda p: intake.from_alertmanager(p, "grafana"), await _json(request, body))
 
 
 @app.post("/alerts/sentry")
@@ -131,8 +134,9 @@ async def receive_sentry(request: Request):
     body = await request.body()
     if not intake.verify_sentry(body, request.headers.get("Sentry-Hook-Signature", "")):
         raise HTTPException(401, "bad sentry signature")
-    if request.headers.get("Sentry-Hook-Resource") == "installation":
-        return {"ok": True, "alerts": []}  # the integration being installed, not an alert
+    resource = request.headers.get("Sentry-Hook-Resource")
+    if resource and resource not in intake.SENTRY_ALERT_RESOURCES:
+        return {"ok": True, "alerts": []}  # e.g. the integration being installed, not an alert
     return _ingest(intake.from_sentry, await _json(request, body))
 
 

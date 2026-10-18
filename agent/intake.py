@@ -10,6 +10,7 @@ import hmac
 import logging
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -122,6 +123,28 @@ def from_alertmanager(payload, source: str = "alertmanager") -> list[Alert]:
     return out
 
 
+def verify_grafana(body: bytes, headers, secret: str | None = None, now: float | None = None) -> bool:
+    """Grafana's optional webhook HMAC: hex HMAC-SHA256 of the raw body, or of
+    "<timestamp>:<body>" when a timestamp header is configured. Header names are
+    configurable in Grafana, so they are here too. No secret = not checked."""
+    secret = secret if secret is not None else os.environ.get("GRAFANA_WEBHOOK_SECRET", "")
+    if not secret:
+        return True
+    sig_header = os.environ.get("GRAFANA_WEBHOOK_SIGNATURE_HEADER", "X-Grafana-Alerting-Signature")
+    ts_header = os.environ.get("GRAFANA_WEBHOOK_TIMESTAMP_HEADER", "")
+    signed = body
+    if ts_header:
+        ts = headers.get(ts_header, "")
+        try:
+            if abs((now if now is not None else time.time()) - int(ts)) > 5 * 60:
+                return False
+        except ValueError:
+            return False
+        signed = ts.encode() + b":" + body
+    expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, (headers.get(sig_header, "") or "").strip())
+
+
 def _real_end(value):
     # Alertmanager and Grafana send endsAt "0001-01-01T00:00:00Z" for "not ended".
     return None if not value or str(value).startswith("0001-") else value
@@ -131,7 +154,10 @@ def _real_end(value):
 
 def verify_sentry(body: bytes, signature: str, secret: str | None = None) -> bool:
     """Sentry-Hook-Signature is hex HMAC-SHA256 of the raw body with the integration's
-    client secret. No secret configured means signatures are not checked."""
+    client secret. No secret configured means signatures are not checked.
+
+    Sentry's docs compute it over JSON.stringify(request.body); Loki uses the raw
+    bytes, which is the same string unless something re-serializes the body."""
     secret = secret if secret is not None else os.environ.get("SENTRY_WEBHOOK_SECRET", "")
     if not secret:
         return True
@@ -146,6 +172,11 @@ def _sentry_service(slug: str | None) -> str:
 
 def _sentry_severity(level: str | None) -> str:
     return {"fatal": "critical", "error": "critical", "warning": "warning"}.get(level or "", "info" if level else "warning")
+
+
+# Sentry-Hook-Resource values that carry an alert; the rest (installation, issue,
+# error, comment, ...) are acknowledged and ignored.
+SENTRY_ALERT_RESOURCES = {"event_alert", "metric_alert"}
 
 
 def from_sentry(payload) -> list[Alert]:
@@ -199,19 +230,32 @@ def _datadog_time(value) -> str:
     return datetime.fromtimestamp(n / 1000 if n > 1e12 else n, timezone.utc).isoformat()
 
 
+# $ALERT_TRANSITION values per https://docs.datadoghq.com/integrations/webhooks/
+_DD_RESOLVED = {"recovered"}
+_DD_WARN = {"warn", "re-warn"}
+_DD_NO_DATA = {"no data", "re-no data"}
+
+
 def from_datadog(payload) -> list[Alert]:
     """The payload template documented in the README ($ALERT_ID, $ALERT_TRANSITION, $TAGS...)."""
     p = _dict(payload, "datadog")
     alert_id = _require(p, "alert_id", "datadog")
     tags = p.get("tags") or ""
-    tags = tags if isinstance(tags, list) else [t.strip() for t in str(tags).split(",")]
-    tag = dict(t.split(":", 1) for t in tags if ":" in t)
-    transition = str(p.get("alert_transition") or "Triggered").lower()
-    status = "resolved" if transition in ("recovered", "resolved") else "firing"
-    severity = "warning" if transition == "warn" else tag.get("severity") or "critical"
+    tags = tags if isinstance(tags, list) else str(tags).split(",")
+    tag = dict(t.strip().split(":", 1) for t in tags if ":" in t)
+    # Triggered, Re-Triggered, Renotify, Warn, Re-Warn, No Data, Re-No Data, Recovered.
+    transition = str(p.get("alert_transition") or "Triggered").strip().lower()
+    status = "resolved" if transition in _DD_RESOLVED else "firing"
+    if tag.get("severity") in SEVERITIES:
+        severity = tag["severity"]
+    elif transition in _DD_WARN or transition in _DD_NO_DATA or str(p.get("alert_type") or "").lower() == "warning":
+        severity = "warning"
+    else:
+        severity = "critical"
     # One monitor alerts once per scope (host, service...), so the scope is part of the id.
-    fp = f"datadog:{alert_id}" + (f":{p['alert_scope']}" if p.get("alert_scope") else "")
-    when = _datadog_time(p.get("date"))
+    scope = ",".join(s.strip() for s in str(p.get("alert_scope") or "").split(",") if s.strip())
+    fp = f"datadog:{alert_id}" + (f":{scope}" if scope else "")
+    when = _datadog_time(p.get("date"))  # $DATE is epoch milliseconds
     return [Alert("datadog", fp, p.get("title") or "DatadogMonitor", tag.get("service") or "unknown",
                   severity, p.get("body"), status, when, when if status == "resolved" else None)]
 
@@ -228,10 +272,10 @@ def verify_pagerduty(body: bytes, header: str, secret: str | None = None) -> boo
 
 
 def from_pagerduty(payload) -> list[Alert]:
-    """V3 webhooks. Only incident.triggered and incident.resolved matter; the rest are acked and ignored."""
+    """V3 webhooks. incident.triggered/reopened open, incident.resolved closes; the rest are acked and ignored."""
     event = _require(_dict(payload, "pagerduty"), "event", "pagerduty")
     kind = _require(event, "event_type", "pagerduty: event")
-    if kind not in ("incident.triggered", "incident.resolved"):
+    if kind not in ("incident.triggered", "incident.reopened", "incident.resolved"):
         return []
     inc = _require(event, "data", "pagerduty: event")
     inc_id = _require(inc, "id", "pagerduty: event.data")
