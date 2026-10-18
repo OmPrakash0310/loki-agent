@@ -25,6 +25,7 @@ Inside `agent/`:
 | `investigator.py` | The model loop: caches, budgets, step limit, cost logging, report |
 | `telemetry.py` | Talks to Grafana Loki, Prometheus and the deploy history |
 | `slack.py` | Slack reports with Confirm / Wrong / View trace buttons |
+| `verifier.py` | Proves a blamed deploy by reproducing the failure in a sandbox (see Verification) |
 | `sources/` | Pluggable deploy and error sources: JSON file, Grafana Loki, GitHub, Sentry |
 | `redact.py` | Removes secrets and personal data before anything reaches the model |
 
@@ -117,6 +118,94 @@ cache, past-incident search and `/investigations/latest/report`.
 Limits: the replay can only see what Grafana Loki and Prometheus still keep (retention), plus
 deploys in `state/deploys.json`. If an earlier incident just before the replayed one isn't
 recorded in Loki's database, its leftover errors aren't cut off and can skew the rule-based suspects.
+
+## Verification
+
+Loki doesn't stop at a guess. When it blames a deploy, the verifier tries to
+prove it: it runs the version that deploy shipped next to the version it
+replaced, sends both the request that failed in production, and marks the root
+cause:
+
+| Verdict | Meaning | Shown as |
+|---|---|---|
+| `CONFIRMED` | The new version fails with the production error; the previous version handles the same request | ✅ Verified by reproduction |
+| `NOT_REPRODUCED` | No such difference: both versions work, both fail, or the new one fails differently | ⚠️ Not reproduced |
+| `INCONCLUSIVE` | The sandbox couldn't answer: no image recorded, no failed request, a Docker error, or the time cap | Unverified, with the reason |
+
+Causes that aren't deploys (a slow database, a hanging dependency) stay
+*Unverified* with a short reason: there is no version to roll back to and run.
+
+**How it works**
+
+1. *Real versions.* Every deploy record names the image it shipped (`image` in
+   `state/deploys.json`). The demo builds one payments-svc image per release:
+   `scripts/build_payments_images.sh` makes `loki-demo/payments-svc:v2.4.0`,
+   `:v2.5.0` (the multi-currency `KeyError` bug from the deploy's diff) and
+   `:v2.5.1` (the revert). The live demo still breaks through `chaos.py`, which
+   switches the same v2.5.0 code path on at runtime, so nothing is redeployed.
+2. *A failed request to replay.* When payments-svc answers 5xx it logs one
+   structured sample of the request, at most once every 30 seconds:
+   `failed request sample: {"method": "POST", "path": "/charge", "status": 500, "error": "KeyError: 'currency'", "body": {...}}`.
+   Fields that look secret (card, cvv, token, password, api key...) are masked
+   and non-JSON bodies are left out. The verifier reads the newest sample logged
+   since the deploy from Grafana Loki.
+3. *A sandbox.* A new Docker network created with `--internal` (no internet, no
+   route to the live stack), a throwaway Postgres seeded with `db/init.sql`, and
+   the two images, each capped at 256 MB. No secrets go in: the only setting is
+   the sandbox database's own URL. Images are never pulled. The request is sent
+   from inside each container, so no ports are published. Everything is named
+   `loki-verify-<run id>` and is removed afterwards, also on errors and timeouts.
+   The whole run is capped at 120 seconds (10 to 15 seconds on a laptop).
+4. *The verdict* goes into the report as `verification: {status, reason, evidence, seconds}`,
+   is shown in the report and in Slack, and is recorded as a `verify` step in the trace.
+
+Try it by hand (no API key needed):
+
+```bash
+scripts/build_payments_images.sh
+python3 agent/verifier.py --bad loki-demo/payments-svc:v2.5.0 --previous loki-demo/payments-svc:v2.4.0 \
+  --request '{"method": "POST", "path": "/charge", "body": {"order_id": 1, "amount": 250.0}, "error": "KeyError: '"'"'currency'"'"'"}'
+```
+
+**Turning it on.** Verification is off unless `LOKI_VERIFY=1`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOKI_VERIFY` | off | `1` runs the verifier after every report that blames a deploy |
+| `LOKI_VERIFY_TIMEOUT_S` | `120` | Hard cap per verification; the sandbox is torn down either way |
+| `LOKI_VERIFY_IMAGE_TEMPLATE` | | Image for deploy records that name none, e.g. `loki-demo/{service}:{version}` (older records in `state/deploys.json` have no `image`) |
+| `LOKI_VERIFY_POSTGRES_IMAGE` | `postgres:16` | Database image for the sandbox (must already be on the host) |
+| `LOKI_VERIFY_INIT_SQL` | `db/init.sql` | Schema to seed the sandbox database with |
+
+The verifier drives Docker with the `docker` CLI. Run on your Mac, that just
+works. **Inside the agent container** it needs, which the default compose
+file deliberately doesn't give it:
+
+- the Docker socket: `- /var/run/docker.sock:/var/run/docker.sock` under the agent's `volumes`;
+- the docker CLI in the image, e.g. `COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker` in `agent/Dockerfile`;
+- the seed schema: `- ./db/init.sql:/app/db/init.sql:ro` plus `LOKI_VERIFY_INIT_SQL=/app/db/init.sql`.
+
+(This in-container setup is documented, not yet tested; the verifier itself
+has been run for real from the host.)
+
+**Security caveat.** Access to the Docker socket is root on the host: whoever
+controls the agent can start any container, mount any host path and read every
+other container's secrets. Loki's own code only creates `--internal`
+`loki-verify-*` networks and containers from images that are already present,
+but a bug in the agent or a compromise of it would not be limited by that. Only
+turn it on where the agent is trusted like an admin, preferably on a separate
+Docker host or VM used just for verification, or behind a socket proxy that
+allows only the container, network, image and exec endpoints (exec and create
+are still powerful, so this narrows the risk rather than removing it).
+
+**Limits.** It proves code bugs that a single replayable request triggers.
+It can't reproduce infrastructure or data problems (a slow database, a full
+disk, a bad row in production, load, a third-party outage), bugs that need
+state built up over many requests, or requests whose masked fields mattered.
+It needs both images on the Docker host, the service's image to include
+`python3` (the request is sent from inside the container) and, for now, a
+service that needs only Postgres. Outside those limits expect `INCONCLUSIVE` or
+`NOT_REPRODUCED`: a missing confirmation is not evidence that the deploy is innocent.
 
 ## Useful endpoints
 
