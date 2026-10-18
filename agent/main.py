@@ -10,7 +10,7 @@ from datetime import datetime
 from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 import auth
@@ -19,6 +19,7 @@ import db
 import intake
 import investigator
 import lessons
+import share
 import slack
 import tools
 from redact import redact
@@ -246,6 +247,28 @@ def trace(inv_id: int):
             "WHERE investigation_id = %s ORDER BY id",
             (inv_id,),
         ).fetchall()
+
+
+@app.get("/share/trace/{inv_id}", response_class=HTMLResponse, include_in_schema=False)
+def shared_trace(inv_id: int, exp: str = "", sig: str = ""):
+    """Read-only HTML of one investigation, opened from a signed link (Slack's "View trace").
+    auth.require_auth already checked the signature; checking again keeps this route safe
+    on its own."""
+    reason = share.verify(inv_id, exp, sig)
+    if reason:
+        raise HTTPException(403, reason)
+    with db.connect() as conn:
+        inv = _get_investigation(conn, inv_id)
+        steps = conn.execute(
+            "SELECT step, tool, input, left(output, 1500) AS output, created_at FROM trace_steps "
+            "WHERE investigation_id = %s ORDER BY id",
+            (inv_id,),
+        ).fetchall()
+    if inv["status"] == "done" and inv.get("report"):
+        text = investigator.render(inv["id"], inv["report"], inv["steps"], float(inv["cost_usd"]))
+    else:
+        text = f"Investigation #{inv['id']} is {inv['status']}."
+    return HTMLResponse(share.render_page(inv, text, steps, int(exp)), headers=share.HEADERS)
 
 
 def _redact_values(obj):

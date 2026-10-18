@@ -507,6 +507,8 @@ startup error instead.
 |---|---|
 | `LOKI_API_KEYS` | Comma-separated `name:key[:scopes]`, e.g. `eval:3f9a...,mcp:b71c...:read`. Scopes: `read`, `write`, `read+write` (default). A bare `key` works too. |
 | `LOKI_WEBHOOK_TOKEN` | Shared secret alert senders may pass as `?token=...` on any `/alerts` path. |
+| `LOKI_LINK_SECRET` | HMAC key for the Slack "View trace" share links (`GET /share/trace/{id}?exp=&sig=`). Unset: derived from `LOKI_API_KEYS` with a warning (rotating a key then breaks old links) |
+| `LOKI_LINK_TTL_S` | Share-link lifetime in seconds (default 604800, 7 days) |
 | `LOKI_REQUIRE_AUTH` | `1` = refuse to start without keys. |
 | `LOKI_API_KEY` | Client side: the key scripts and the MCP server send. |
 
@@ -585,6 +587,10 @@ are refused with 401.
 
 Note: `LOKI_PUBLIC_URL` exposes the agent's read endpoints (traces include log
 lines) to whoever can reach that URL. Put it behind your VPN or an auth proxy.
+The "View trace" button is a signed, expiring link (`/share/trace/{id}?exp=&sig=`)
+to a read-only HTML page for that one investigation, so it opens in a browser
+without an API key; anyone holding the link can read that page until it expires.
+A bad, tampered or expired signature gets 403.
 
 ## Supported languages
 

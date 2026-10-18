@@ -25,6 +25,9 @@ log = logging.getLogger("agent")
 PUBLIC_PATHS = {"/health", "/slack/interactions"}
 # Any path under this prefix also accepts LOKI_WEBHOOK_TOKEN as ?token=.
 WEBHOOK_PREFIX = "/alerts"
+# GET /share/trace/{id} needs no API key but must carry a valid signed ?exp=&sig=
+# (see share.py); a bad or expired signature is a 403 here, before any route runs.
+SHARE_METHODS = {"GET", "HEAD"}
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 SCOPES = {"read", "write"}
 
@@ -94,6 +97,14 @@ def require_auth(request: Request):
     request.state.actor = "anonymous"
     if path in PUBLIC_PATHS:
         return
+    import share  # share imports auth
+    m = share.PATH_RE.fullmatch(path)
+    if m and request.method in SHARE_METHODS:
+        reason = share.verify(int(m.group(1)), request.query_params.get("exp", ""), request.query_params.get("sig", ""))
+        if reason:
+            raise HTTPException(403, reason)
+        request.state.actor = "share-link"
+        return
     keys = _keys()
     is_webhook = path == WEBHOOK_PREFIX or path.startswith(WEBHOOK_PREFIX + "/")
     if is_webhook:
@@ -117,7 +128,7 @@ def require_auth(request: Request):
     request.state.actor = key.name
 
 
-_TOKEN_RE = re.compile(r"(token=)[^&\s\"]+", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"((?:token|sig)=)[^&\s\"]+", re.IGNORECASE)
 
 
 def _redact_arg(a):
