@@ -96,6 +96,11 @@ services:
       LOKI_MAX_STEPS: ${LOKI_MAX_STEPS:-8}
       LOKI_MAX_COST_USD: ${LOKI_MAX_COST_USD:-0.10}
       LOKI_DAILY_BUDGET_USD: ${LOKI_DAILY_BUDGET_USD:-1.00}
+      # Self-improvement (README "Self-improvement"). Empty LOKI_CRITIC = on for Claude models only.
+      LOKI_CRITIC: ${LOKI_CRITIC:-}
+      LOKI_CRITIC_MODEL: ${LOKI_CRITIC_MODEL:-claude-haiku-4-5}
+      LOKI_LESSONS: ${LOKI_LESSONS:-1}
+      LOKI_LESSONS_MODEL: ${LOKI_LESSONS_MODEL:-claude-haiku-4-5}
       # Point at Ollama on your Mac to use a free local model (see .env.example).
       # Its own name, so a shell's ANTHROPIC_BASE_URL can't switch Loki into local mode.
       LOKI_OLLAMA_URL: ${LOKI_OLLAMA_URL:-}

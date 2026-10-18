@@ -20,7 +20,9 @@ from types import SimpleNamespace
 import anthropic
 
 import context
+import critic
 import db
+import lessons
 import slack
 import telemetry as tm
 import tools
@@ -180,18 +182,30 @@ def _spent_today(conn) -> float:
     return float(row["spent"])
 
 
-def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing, budget: float):
-    """Investigate with one model. Returns (report, steps, tokens_in, tokens_out, cost)."""
+def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing, budget: float,
+              session: SimpleNamespace | None = None, max_steps: int | None = None):
+    """Investigate with one model. Returns (report, steps, tokens_in, tokens_out, cost).
+
+    session (optional) collects the conversation and every tool result, so the critic can
+    check the report and the investigator can continue the same conversation for one revision.
+    Pass a session that already has messages to continue it; max_steps then bounds the extra steps.
+    """
     if model == "fake":
         _fake_state["next_suspects"] = briefing.suspects
-    messages = [{"role": "user", "content": briefing.text}]
+    if session is None:
+        session = SimpleNamespace(messages=None, observations=[], submit_id=None, step_base=0)
+    if session.messages is None:
+        session.messages = [{"role": "user", "content": briefing.text}]
+        session.observations = [{"step": 0, "tool": "briefing", "input": {}, "output": briefing.text}]
+    messages = session.messages
+    limit = MAX_STEPS if max_steps is None else max_steps
     report, steps, tokens_in, tokens_out, cost = None, 0, 0, 0, 0.0
 
     while report is None:
         steps += 1
-        last_chance = steps >= MAX_STEPS or cost >= budget * 0.7
-        if steps > MAX_STEPS or cost >= budget:
-            raise BudgetExceeded(f"stopped at step {steps - 1}, ${cost:.4f} spent (limit ${budget:.2f}, {MAX_STEPS} steps)")
+        last_chance = steps >= limit or cost >= budget * 0.7
+        if steps > limit or cost >= budget:
+            raise BudgetExceeded(f"stopped at step {steps - 1}, ${cost:.4f} spent (limit ${budget:.2f}, {limit} steps)")
         if last_chance:
             messages.append({"role": "user", "content": "You're at your step or budget limit. Call submit_report now "
                              "with what you have, and lower confidence to match the evidence."})
@@ -201,7 +215,8 @@ def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing,
         tokens_in += resp.usage.input_tokens
         tokens_out += resp.usage.output_tokens
         cost += call_cost
-        _trace(conn, inv_id, steps, "llm", {}, f"stop_reason={resp.stop_reason}", model, resp.usage, round(call_cost, 5))
+        step_no = session.step_base + steps
+        _trace(conn, inv_id, step_no, "llm", {}, f"stop_reason={resp.stop_reason}", model, resp.usage, round(call_cost, 5))
 
         if resp.stop_reason == "refusal":
             raise RuntimeError(f"model declined: {resp.stop_details}")
@@ -216,15 +231,21 @@ def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing,
         for tu in tool_uses:
             if tu.name == "submit_report":
                 report = tu.input
-                _trace(conn, inv_id, steps, tu.name, tu.input, "report submitted")
+                session.submit_id = tu.id
+                _trace(conn, inv_id, step_no, tu.name, tu.input, "report submitted")
                 continue
             output, is_error = tools.run(tu.name, tu.input)
-            _trace(conn, inv_id, steps, tu.name, tu.input, output)
-            log.info("investigation #%s step %d: %s(%s)", inv_id, steps, tu.name, json.dumps(tu.input))
+            _trace(conn, inv_id, step_no, tu.name, tu.input, output)
+            session.observations.append({"step": len(session.observations), "tool": tu.name, "input": tu.input,
+                                         "output": ("ERROR: " if is_error else "") + output})
+            log.info("investigation #%s step %d: %s(%s)", inv_id, step_no, tu.name, json.dumps(tu.input))
             results.append({"type": "tool_result", "tool_use_id": tu.id, "content": output, "is_error": is_error})
         if report is None:
             messages.append({"role": "user", "content": results})
+        else:
+            session.pending_results = results  # other tool calls made alongside submit_report
 
+    session.step_base += steps
     _fake_state.pop(id(messages), None)
     return report, steps, tokens_in, tokens_out, cost
 
@@ -308,20 +329,35 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
                 "Check whether the same cause applies now; don't assume it."
             )
             cache_hit = f"hint:{similar['investigation_id']}"
+        # Lessons learned from verified mistakes (human rejects, eval misses, manual).
+        # A backtest only sees lessons that existed at its replay time.
+        if lessons.enabled():
+            section = lessons.briefing_section(conn, incidents, briefing.text,
+                                               before=tm.now() if backtest else None, count_use=not backtest)
+            if section:
+                briefing.text += "\n\n" + section
         _trace(conn, inv_id, 0, "briefing", {"fingerprint": briefing.exact_key, "cache": cache_hit}, briefing.text)
 
         # 3. Investigate with the cheap model; escalate only if it's unsure and budget allows.
         # Ollama ignores the key but the SDK needs one.
         client = (anthropic.Anthropic(api_key="ollama", base_url=OLLAMA_URL) if LOCAL
                   else None if model == "fake" else anthropic.Anthropic())
-        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, model, briefing, MAX_COST_USD)
+        session = SimpleNamespace(messages=None, observations=[], submit_id=None, step_base=0)
+        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, model, briefing, MAX_COST_USD, session)
         model_used = model
         # The fake model never escalates: a free run must stay free.
         if ESCALATE_MODEL and model != "fake" and report["confidence"] < ESCALATE_BELOW and cost < MAX_COST_USD:
             log.warning("investigation #%s: confidence %.2f, escalating to %s", inv_id, report["confidence"], ESCALATE_MODEL)
             strong = anthropic.Anthropic()
-            report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, MAX_COST_USD - cost)
+            session = SimpleNamespace(messages=None, observations=[], submit_id=None, step_base=steps)
+            report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, MAX_COST_USD - cost, session)
             steps, t_in, t_out, cost, model_used = steps + s2, t_in + i2, t_out + o2, cost + c2, f"{model}+{ESCALATE_MODEL}"
+            client, model = strong, ESCALATE_MODEL
+
+        # 3b. Critic (LOKI_CRITIC): one cheap check of every claim against the tool results.
+        if critic.enabled(model, LOCAL):
+            report, s3, i3, o3, c3 = _critique(conn, client, inv_id, model, briefing, session, report, steps, cost)
+            steps, t_in, t_out, cost = steps + s3, t_in + i3, t_out + o3, cost + c3
 
         # 4. Prove it (LOKI_VERIFY=1): reproduce a blamed deploy in a sandbox. Backtests
         # skip this: they replay what Loki would have said, not what it can rerun now.
@@ -346,6 +382,54 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
             (briefing.exact_key, briefing.fingerprint, inv_id, json.dumps(report), CACHE_TTL_DAYS),
         )
     _finish(inv_id, report, steps, cost)
+
+
+def _critic_pass(conn, inv_id: int, step: int, report: dict, session) -> tuple[dict, float, int, int]:
+    """One critic call. Returns (normalized critique, cost, tokens in, tokens out)."""
+    cm = critic.model()
+    client = None if cm == "fake" else anthropic.Anthropic()
+    raw, usage = critic.call(client, cm, report, session.observations)
+    c = _cost(cm, usage)[0]
+    crit = critic.normalize(raw, report, session.observations)
+    _trace(conn, inv_id, step, "critic", {"model": cm, "verdict": crit["verdict"]}, json.dumps(crit), cm, usage, round(c, 5))
+    return crit, c, usage.input_tokens, usage.output_tokens
+
+
+def _critique(conn, client, inv_id, model, briefing, session, report, steps, cost):
+    """Critic, then at most one revision round and one re-critique. Never fails the investigation.
+    Returns (report, extra steps, tokens in, tokens out, extra cost)."""
+    extra_steps, t_in, t_out, spent = 0, 0, 0, 0.0
+    if cost >= MAX_COST_USD:
+        return report, 0, 0, 0, 0.0
+    try:
+        crit, c, i, o = _critic_pass(conn, inv_id, steps, report, session)
+    except Exception as e:
+        log.warning("investigation #%s: critic failed, report kept as is: %s", inv_id, e)
+        return report, 0, 0, 0, 0.0
+    spent, t_in, t_out = c, i, o
+    final_report, final_crit, rounds, first = report, crit, 1, None
+    steps_left = MAX_STEPS - steps
+    budget_left = MAX_COST_USD - cost - spent
+    if crit["verdict"] == "revise" and steps_left > 0 and budget_left > 0 and session.submit_id:
+        # The API needs a tool_result for the submit_report call: the critic's notes go there.
+        session.messages.append({"role": "user", "content": [
+            *getattr(session, "pending_results", []),
+            {"type": "tool_result", "tool_use_id": session.submit_id, "content": critic.revision_prompt(crit)},
+        ]})
+        try:
+            revised, s2, i2, o2, c2 = _run_loop(conn, client, inv_id, model, briefing, budget_left, session, steps_left)
+            extra_steps, t_in, t_out, spent = s2, t_in + i2, t_out + o2, spent + c2
+            crit2, c3, i3, o3 = _critic_pass(conn, inv_id, steps + s2, revised, session)
+            spent, t_in, t_out = spent + c3, t_in + i3, t_out + o3
+            first = {"verdict": crit["verdict"], "notes": crit["notes"],
+                     "unsupported": sum(c_["status"] != "supported" for c_ in crit["claims"] if c_["status"] != "unjudged")}
+            final_report, final_crit, rounds = revised, crit2, 2
+        except Exception as e:  # out of steps/budget mid-revision: keep the first report and its critique
+            log.warning("investigation #%s: revision stopped (%s); keeping the first report", inv_id, e)
+    out = critic.apply(final_report, final_crit, {"model": critic.model(), "rounds": rounds,
+                                                  **({"first_pass": first} if first else {})})
+    log.warning("investigation #%s: %s", inv_id, critic.headline(out["critique"]))
+    return out, extra_steps, t_in, t_out, spent
 
 
 def _verify(conn, inv_id: int, steps: int, report: dict) -> None:
@@ -376,6 +460,8 @@ def render(inv_id: int, r: dict, steps: int, cost: float) -> str:
     ]
     if r.get("ruled_out"):
         lines += ["", "*Ruled out*", *[f"• {e}" for e in r["ruled_out"]]]
+    if r.get("critique"):
+        lines += ["", f"_{critic.headline(r['critique'])}_"]
     v = r.get("verification")
     if v:
         lines += ["", f"*Verification:* {verifier.headline(v)}", *[f"• {e}" for e in v.get("evidence", [])]]
