@@ -120,17 +120,25 @@ def require_auth(request: Request):
 _TOKEN_RE = re.compile(r"(token=)[^&\s\"]+", re.IGNORECASE)
 
 
+def _redact_arg(a):
+    if isinstance(a, (int, float)) or a is None:
+        return a
+    text = a if isinstance(a, str) else str(a)  # e.g. an httpx URL object
+    return _TOKEN_RE.sub(r"\1***", text) if _TOKEN_RE.search(text) else a
+
+
 class RedactTokenFilter(logging.Filter):
     """Uvicorn's access log prints query strings; hide ?token=... there."""
 
     def filter(self, record):
         if record.args:
-            record.args = tuple(_TOKEN_RE.sub(r"\1***", a) if isinstance(a, str) else a for a in record.args)
+            record.args = tuple(_redact_arg(a) for a in record.args)
         if isinstance(record.msg, str):
             record.msg = _TOKEN_RE.sub(r"\1***", record.msg)
         return True
 
 
 def install_log_filter():
-    for name in ("uvicorn.access", "uvicorn.error", "agent"):
+    # httpx/httpx2 log request URLs (httpx2 is what Starlette's TestClient uses).
+    for name in ("uvicorn.access", "uvicorn.error", "agent", "httpx", "httpx2"):
         logging.getLogger(name).addFilter(RedactTokenFilter())

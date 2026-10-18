@@ -769,9 +769,11 @@ skipped with a note.
 Run the tests (no Docker, no network):
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install httpx==0.27.2 pytest
-.venv/bin/pytest tests
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest
 ```
+
+`requirements-dev.txt` installs the agent, the MCP server and the test dependencies into
+one venv; they resolve together (no hand-pinned `starlette` needed).
 
 ## Using your own metrics
 

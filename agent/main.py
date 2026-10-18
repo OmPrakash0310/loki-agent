@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from urllib.parse import parse_qs
 
@@ -35,12 +36,9 @@ JOIN_WINDOW_S = 300
 
 # Secure by default: this dependency runs for every route, including ones added
 # later. Public paths are an explicit allowlist in auth.py.
-app = FastAPI(dependencies=[Depends(auth.require_auth)])
-auth.install_log_filter()
 _group_lock = threading.Lock()
 
 
-@app.on_event("startup")
 def startup():
     auth.check_startup()
     db.init()
@@ -52,6 +50,17 @@ def startup():
         ).fetchall()
     if orphaned:
         log.warning("marked %d orphaned investigation(s) as failed: %s", len(orphaned), [r["id"] for r in orphaned])
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    # on_event("startup") is deprecated in FastAPI; lifespan replaces it.
+    startup()
+    yield
+
+
+app = FastAPI(dependencies=[Depends(auth.require_auth)], lifespan=lifespan)
+auth.install_log_filter()
 
 
 def _attach_to_investigation(conn, incident_id: int) -> tuple[int, bool]:
