@@ -17,6 +17,7 @@ past.jsonl has one incident per line:
 """
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -100,7 +101,10 @@ def grade(report: dict, expected: dict) -> dict[str, bool]:
 
 def post_backtest(agent: str, at: datetime, alerts, model, delay: int) -> dict:
     body = json.dumps({"at": at.isoformat(), "alerts": alerts, "model": model, "delay_s": delay}).encode()
-    req = urllib.request.Request(agent + "/backtest", data=body, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("LOKI_API_KEY"):  # needs a key with the write scope
+        headers["Authorization"] = f"Bearer {os.environ['LOKI_API_KEY']}"
+    req = urllib.request.Request(agent + "/backtest", data=body, headers=headers)
     try:
         # Synchronous on the agent: a real model can take a few minutes.
         with urllib.request.urlopen(req, timeout=600) as r:

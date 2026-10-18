@@ -276,6 +276,40 @@ token, for when the agent API gets auth. Loki's root cause is a hypothesis that 
 not been verified by reproduction; the fix brief says so, and the agent should
 reproduce it in a test before trusting it.
 
+## Securing Loki
+
+Traces contain log lines and confirm/reject change what Loki reuses, so **any
+deployment reachable from outside your laptop (a tunnel for Slack included) must
+set `LOKI_API_KEYS`**. Without it Loki runs open for the local demo and logs a
+loud warning at startup. Set `LOKI_REQUIRE_AUTH=1` to make a missing key a
+startup error instead.
+
+| Variable | Meaning |
+|---|---|
+| `LOKI_API_KEYS` | Comma-separated `name:key[:scopes]`, e.g. `eval:3f9a...,mcp:b71c...:read`. Scopes: `read`, `write`, `read+write` (default). A bare `key` works too. |
+| `LOKI_WEBHOOK_TOKEN` | Shared secret alert senders may pass as `?token=...` on any `/alerts` path. |
+| `LOKI_REQUIRE_AUTH` | `1` = refuse to start without keys. |
+| `LOKI_API_KEY` | Client side: the key scripts and the MCP server send. |
+
+Every endpoint needs `Authorization: Bearer <key>`, including endpoints added
+later: one app-level dependency guards them all. GETs need `read`; confirm,
+reject and backtest need `write`. The exceptions:
+
+- `GET /health`: public, returns no data.
+- `POST /slack/interactions`: checked with Slack's signature (`SLACK_SIGNING_SECRET`).
+- `/alerts` and anything under it: the bearer key **or** `?token=<LOKI_WEBHOOK_TOKEN>`,
+  for Alertmanager, Datadog and others that can't set headers. Point Alertmanager at
+  `http://agent:8080/alerts?token=...` (see `observability/alertmanager.yml`).
+
+Keys are compared in constant time and never logged (only key names, and
+`?token=` is masked in access logs). Every confirm, reject and backtest goes to
+the `audit_log` table with the key name (or `slack:<user>`) and time.
+
+Clients: `scripts/eval.py`, `run_scenarios.py` and `backtest.py` and the MCP
+server send `LOKI_API_KEY` from the environment. Note that the Slack
+"View trace" link opens in a browser without a key, so it gets 401 when auth
+is on.
+
 ## Settings
 
 Set these in `.env` (see `.env.example`).

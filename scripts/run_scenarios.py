@@ -4,6 +4,7 @@ Usage: python3 scripts/run_scenarios.py [bad_deploy slow_db timeout]
 This is the start of Loki's eval harness: each scenario has a known cause.
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -20,8 +21,14 @@ EXPECTED = {
 }
 
 
+def auth_headers():
+    """Bearer token for Loki when it runs with LOKI_API_KEYS set."""
+    key = os.environ.get("LOKI_API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
 def get(path):
-    with urllib.request.urlopen(AGENT + path, timeout=10) as r:
+    with urllib.request.urlopen(urllib.request.Request(AGENT + path, headers=auth_headers()), timeout=10) as r:
         body = r.read().decode()
     return json.loads(body) if body.startswith(("[", "{")) else body
 

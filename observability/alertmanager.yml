@@ -8,5 +8,9 @@ route:
 receivers:
   - name: incident-agent
     webhook_configs:
-      - url: http://agent:8080/alerts  # the "doorbell"
+      # The "doorbell". When Loki runs with LOKI_WEBHOOK_TOKEN (or LOKI_API_KEYS) set,
+      # append the token: http://agent:8080/alerts?token=<LOKI_WEBHOOK_TOKEN>
+      # Alertmanager can't expand env vars here; to keep the secret out of git use
+      # `url_file: /etc/alertmanager/loki_webhook_url` instead of `url`.
+      - url: http://agent:8080/alerts
         send_resolved: true

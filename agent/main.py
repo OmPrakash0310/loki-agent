@@ -8,10 +8,11 @@ import time
 from datetime import datetime
 from urllib.parse import parse_qs
 
-from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel
 
+import auth
 import backtest
 import db
 import investigator
@@ -30,12 +31,16 @@ GROUP_WINDOW_S = 25
 # A new alert joins an investigation created within this many seconds.
 JOIN_WINDOW_S = 300
 
-app = FastAPI()
+# Secure by default: this dependency runs for every route, including ones added
+# later. Public paths are an explicit allowlist in auth.py.
+app = FastAPI(dependencies=[Depends(auth.require_auth)])
+auth.install_log_filter()
 _group_lock = threading.Lock()
 
 
 @app.on_event("startup")
 def startup():
+    auth.check_startup()
     db.init()
     # Investigations run in background threads; a restart kills them. Don't leave them hanging.
     with db.connect() as conn:
@@ -109,6 +114,12 @@ async def receive_alerts(request: Request):
                     (alert["endsAt"], fp),
                 )
                 log.info("resolved incident fingerprint=%s", fp)
+    return {"ok": True}
+
+
+@app.get("/health")
+def health():
+    """Liveness probe. Public, so it returns no data."""
     return {"ok": True}
 
 
@@ -208,7 +219,14 @@ def _record_feedback(conn, inv_id: int, verdict: str, who: str | None, user_id: 
     )
 
 
-def _confirm(inv_id: int, who: str | None = None, user_id: str | None = None) -> dict:
+def _audit(conn, actor: str, action: str, inv_id: int | None):
+    """Who did a write action. actor is an API key name, "slack:<user>" or "anonymous" (dev mode)."""
+    conn.execute(
+        "INSERT INTO audit_log (actor, action, investigation_id) VALUES (%s, %s, %s)", (actor, action, inv_id)
+    )
+
+
+def _confirm(inv_id: int, who: str | None = None, user_id: str | None = None, actor: str | None = None) -> dict:
     with db.connect() as conn:
         inv = _get_investigation(conn, inv_id)
         if inv["mode"] != "live":
@@ -223,10 +241,12 @@ def _confirm(inv_id: int, who: str | None = None, user_id: str | None = None) ->
             (inv["cache_key"], inv["fingerprint"], inv_id, json.dumps(inv["report"]), investigator.CACHE_TTL_DAYS),
         )
         _record_feedback(conn, inv_id, "confirmed", who, user_id)
+        _audit(conn, actor or f"slack:{who or user_id}", "confirm", inv_id)
     return {"confirmed": inv_id, "cache_key": inv["cache_key"]}
 
 
-def _reject(inv_id: int, who: str | None = None, user_id: str | None = None, reason: str | None = None) -> dict:
+def _reject(inv_id: int, who: str | None = None, user_id: str | None = None, reason: str | None = None,
+            actor: str | None = None) -> dict:
     with db.connect() as conn:
         inv = _get_investigation(conn, inv_id)
         if inv["status"] != "done":
@@ -237,20 +257,21 @@ def _reject(inv_id: int, who: str | None = None, user_id: str | None = None, rea
         if inv["cache_key"] and inv["mode"] == "live":
             conn.execute("UPDATE report_cache SET confirmed = false WHERE exact_key = %s", (inv["cache_key"],))
         _record_feedback(conn, inv_id, "rejected", who, user_id, reason)
+        _audit(conn, actor or f"slack:{who or user_id}", "reject", inv_id)
     return {"rejected": inv_id}
 
 
 @app.post("/investigations/{inv_id}/confirm")
-def confirm(inv_id: int):
+def confirm(inv_id: int, request: Request):
     """A human confirms the root cause was right (the fix worked). Only confirmed
     answers are reused for free when the exact same incident happens again."""
-    return _confirm(inv_id)
+    return _confirm(inv_id, actor=request.state.actor)
 
 
 @app.post("/investigations/{inv_id}/reject")
-def reject(inv_id: int, reason: str | None = Body(None, embed=True)):
+def reject(inv_id: int, request: Request, reason: str | None = Body(None, embed=True)):
     """A human says the root cause was wrong. Optional JSON body: {"reason": "..."}."""
-    return _reject(inv_id, reason=reason)
+    return _reject(inv_id, reason=reason, actor=request.state.actor)
 
 
 @app.post("/slack/interactions")
@@ -307,7 +328,7 @@ class BacktestRequest(BaseModel):
 
 
 @app.post("/backtest")
-def run_backtest(req: BacktestRequest):
+def run_backtest(req: BacktestRequest, request: Request):
     """Replay a past incident synchronously: Loki investigates it with the clock set
     back, so nothing after that moment is visible. Returns the full investigation."""
     if req.model and req.model not in backtest.ALLOWED_MODELS:
@@ -316,6 +337,7 @@ def run_backtest(req: BacktestRequest):
         alerts = backtest.parse_alerts(req.alerts)
         with db.connect() as conn:
             inv_id = backtest.create(conn, req.at, alerts, req.delay_s)
+            _audit(conn, request.state.actor, "backtest", inv_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     log.warning("backtest #%s: replaying %s", inv_id, req.at.isoformat())
