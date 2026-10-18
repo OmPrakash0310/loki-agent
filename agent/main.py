@@ -17,6 +17,7 @@ import db
 import investigator
 import slack
 import tools
+from redact import redact
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s agent %(message)s")
 log = logging.getLogger("agent")
@@ -174,6 +175,30 @@ def trace(inv_id: int):
             "WHERE investigation_id = %s ORDER BY id",
             (inv_id,),
         ).fetchall()
+
+
+def _redact_values(obj):
+    """Redact each string on its own: redacting the JSON text could swallow a closing quote."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {k: _redact_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_values(v) for v in obj]
+    return obj
+
+
+@app.get("/deploys/{deploy_id:path}/diff")
+def deploy_diff(deploy_id: str):
+    """A deploy's diff, read-only, for the MCP server. `:path` because GitHub ids
+    look like owner/repo:pr:123."""
+    try:
+        diff = tools.git_diff(deploy_id)
+    except ValueError as e:  # the deploy sources raise ValueError for an unknown id
+        raise HTTPException(404, str(e))
+    except Exception as e:  # e.g. GitHub unreachable: say so instead of a bare 500
+        raise HTTPException(502, f"could not fetch the diff: {type(e).__name__}: {e}")
+    return _redact_values(diff)
 
 
 def _record_feedback(conn, inv_id: int, verdict: str, who: str | None, user_id: str | None, reason: str | None = None):
