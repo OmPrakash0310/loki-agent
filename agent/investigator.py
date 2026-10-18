@@ -24,6 +24,7 @@ import db
 import slack
 import telemetry as tm
 import tools
+import verifier
 
 log = logging.getLogger("agent")
 
@@ -319,6 +320,11 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
             report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, MAX_COST_USD - cost)
             steps, t_in, t_out, cost, model_used = steps + s2, t_in + i2, t_out + o2, cost + c2, f"{model}+{ESCALATE_MODEL}"
 
+        # 4. Prove it (LOKI_VERIFY=1): reproduce a blamed deploy in a sandbox. Backtests
+        # skip this: they replay what Loki would have said, not what it can rerun now.
+        if not backtest:
+            _verify(conn, inv_id, steps, report)
+
         conn.execute(
             "UPDATE investigations SET status = 'done', finished_at = now(), report = %s, steps = %s, input_tokens = %s, "
             "output_tokens = %s, cost_usd = %s, model = %s, cache_hit = %s WHERE id = %s",
@@ -339,6 +345,16 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
     _finish(inv_id, report, steps, cost)
 
 
+def _verify(conn, inv_id: int, steps: int, report: dict) -> None:
+    """Attach the verifier's verdict to the report (in place). Never raises."""
+    verification = verifier.verify_report(report)
+    if verification is None:
+        return  # verification is off
+    report["verification"] = verification
+    _trace(conn, inv_id, steps, "verify", {"deploy_id": report.get("deploy_id", "")}, json.dumps(verification))
+    log.warning("investigation #%s: verification %s (%s)", inv_id, verification["status"], verification["reason"])
+
+
 def _finish(inv_id: int, report: dict, steps: int, cost: float):
     text = render(inv_id, report, steps, cost)
     log.warning("investigation #%s done\n%s", inv_id, text)
@@ -357,10 +373,13 @@ def render(inv_id: int, r: dict, steps: int, cost: float) -> str:
     ]
     if r.get("ruled_out"):
         lines += ["", "*Ruled out*", *[f"• {e}" for e in r["ruled_out"]]]
+    v = r.get("verification")
+    if v:
+        lines += ["", f"*Verification:* {verifier.headline(v)}", *[f"• {e}" for e in v.get("evidence", [])]]
     lines += [
         "",
         f"*Suggested action: {r['suggested_action']}*. {r['action_detail']}",
-        f"_Affected: {', '.join(r['affected_services'])} · {steps} steps · ${cost:.4f} · not verified by reproduction yet_",
+        f"_Affected: {', '.join(r['affected_services'])} · {steps} steps · ${cost:.4f} · {verifier.label(v)}_",
     ]
     return "\n".join(lines)
 
