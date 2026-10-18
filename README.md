@@ -125,8 +125,67 @@ recorded in Loki's database, its leftover errors aren't cut off and can skew the
 - `localhost:8088/investigations/<id>/trace`: every tool call Loki made
 - `POST localhost:8088/investigations/<id>/reject`: mark a report wrong (optional body `{"reason": "..."}`)
 - `localhost:8088/incidents`: alerts and which investigation they joined
+- `localhost:8088/deploys/<deploy_id>/diff`: the diff a deploy shipped (redacted)
 - `POST localhost:8088/backtest`: replay a past incident (see Backtesting)
 - `localhost:3000`: Grafana (Explore → Loki for logs)
+
+## Use Loki from Claude Code / Cursor
+
+`mcp/loki_mcp.py` is an MCP server (stdio) that lets a coding agent ask Loki what
+broke and use the diagnosis to draft a fix: Loki finds the root cause, the coding
+agent writes the fix and a regression test, a human reviews and ships it. Every
+tool is a read-only GET against the agent API; nothing confirms, rejects or
+changes an investigation.
+
+| Tool | What it returns |
+|---|---|
+| `list_incidents(limit=10)` | Recent production investigations: status, summary, confidence, alerts, time |
+| `get_root_cause(investigation_id=None)` | Root cause (latest finished one by default) split into evidence and hypothesis, the deploy and its diff summary, `file:line` hints, the error signature, confidence, and a fix brief |
+| `get_evidence(investigation_id)` | Every step Loki took: briefing, tool calls and their (cut) outputs |
+| `get_deploy_diff(deploy_id)` | The deploy's diff with per-file changed line numbers |
+
+It also has a prompt, `fix_incident`, that walks the agent through: fetch the root
+cause, read the diff and files, check the hypothesis against the code, write a
+failing regression test and a minimal fix, and never deploy or touch production.
+
+Install it in its own venv on your machine (not the agent container), from the repo root:
+
+```bash
+python3.12 -m venv mcp/.venv
+mcp/.venv/bin/pip install -r mcp/requirements.txt
+```
+
+**Claude Code** (run from the repo root so `$(pwd)` expands to it):
+
+```bash
+claude mcp add loki --scope user -e LOKI_URL=http://localhost:8088 -- "$(pwd)/mcp/.venv/bin/python" "$(pwd)/mcp/loki_mcp.py"
+```
+
+**Cursor** (`~/.cursor/mcp.json`, or `.cursor/mcp.json` in the project you're fixing; use absolute paths):
+
+```json
+{
+  "mcpServers": {
+    "loki": {
+      "command": "/path/to/incident-agent/mcp/.venv/bin/python",
+      "args": ["/path/to/incident-agent/mcp/loki_mcp.py"],
+      "env": { "LOKI_URL": "http://localhost:8088" }
+    }
+  }
+}
+```
+
+Then, in the repo of the service that broke:
+
+> Use Loki to find what broke and draft a fix.
+
+or run the `fix_incident` prompt (`/mcp__loki__fix_incident` in Claude Code).
+
+`LOKI_URL` here is Loki's agent API (port 8088), not Grafana Loki (port 3100, which
+the agent's own `LOKI_URL` points at). `LOKI_API_KEY`, if set, is sent as a bearer
+token, for when the agent API gets auth. Loki's root cause is a hypothesis that has
+not been verified by reproduction; the fix brief says so, and the agent should
+reproduce it in a test before trusting it.
 
 ## Settings
 
