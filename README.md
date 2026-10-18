@@ -213,6 +213,7 @@ service that needs only Postgres. Outside those limits expect `INCONCLUSIVE` or
 - `localhost:8088/investigations/<id>/report`: the root-cause report
 - `localhost:8088/investigations/<id>/trace`: every tool call Loki made
 - `POST localhost:8088/investigations/<id>/reject`: mark a report wrong (optional body `{"reason": "..."}`)
+- `POST localhost:8088/investigations/manual`: start an investigation by hand (see Connecting your alerts)
 - `localhost:8088/incidents`: alerts and which investigation they joined
 - `localhost:8088/deploys/<deploy_id>/diff`: the diff a deploy shipped (redacted)
 - `POST localhost:8088/backtest`: replay a past incident (see Backtesting)
@@ -388,6 +389,102 @@ Loki as one entry (JSON loggers, or Promtail/Alloy `multiline` stage) or when
 the error without a location. Traces from two requests of the same service that
 interleave line by line can be folded together. Other languages still work
 as before, as plain error lines.
+
+## Connecting your alerts
+
+Any of these starts an investigation. Every source goes through the same flow:
+an alert already open with the same fingerprint is ignored (dedup), alerts that
+arrive within 5 minutes of each other join one investigation whatever tool sent
+them (a Sentry alert and a Prometheus alert from the same failure are one
+storm), and a resolved event closes the incident. A payload Loki can't read gets
+a 400 that says what is missing; an unknown service is accepted (as given, or
+`unknown`). Replace `loki.example.com` with where port 8088 is reachable.
+
+| Source | URL | Signature check |
+|---|---|---|
+| Prometheus Alertmanager | `POST /alerts` | none |
+| Grafana alerting | `POST /alerts/grafana` | none |
+| Sentry | `POST /alerts/sentry` | `SENTRY_WEBHOOK_SECRET` |
+| Datadog | `POST /alerts/datadog` | none (Datadog webhooks are unsigned) |
+| PagerDuty | `POST /alerts/pagerduty` | `PAGERDUTY_WEBHOOK_SECRET` |
+| Anything else | `POST /alerts/generic` | none |
+| A human | `POST /investigations/manual` | none |
+
+| Variable | Meaning |
+|---|---|
+| `SENTRY_PROJECTS` | `project-slug=service,...` (shared with the Sentry integration). An unmapped project's slug is used as the service |
+| `SENTRY_WEBHOOK_SECRET` | The internal integration's Client Secret. When set, a missing or wrong `Sentry-Hook-Signature` is rejected (401) |
+| `PAGERDUTY_WEBHOOK_SECRET` | The V3 webhook's signing secret. When set, a wrong `X-PagerDuty-Signature` is rejected (401) |
+
+Severity is normalized to `critical`, `warning` or `info`.
+
+**Prometheus Alertmanager.** A webhook receiver pointing at `http://loki.example.com/alerts`
+(see `observability/alertmanager.yml`). Labels `alertname`, `service` and `severity`
+and the `summary` annotation are used.
+
+**Grafana alerting.** Alerting → Contact points → New → Webhook, URL
+`http://loki.example.com/alerts/grafana`. Give alert rules a `service` label
+(else `service_name` or `job` is used, then `unknown`) and a `summary` annotation.
+
+**Sentry.** Settings → Developer Settings → Custom Integration → Internal Integration.
+Webhook URL `http://loki.example.com/alerts/sentry`, turn on **Alert Rule Action**,
+save, and put its Client Secret in `SENTRY_WEBHOOK_SECRET`. Then in an issue alert
+rule add the action "Send a notification via <integration>"; in a metric alert, add
+it as the critical/warning action. Issue alerts open an incident per Sentry issue
+(Sentry sends no resolve for issue alerts, so that incident stays open and repeats of
+the same issue are deduplicated); metric alerts open on `critical`/`warning` and
+close on `resolved`. The service comes from `SENTRY_PROJECTS`.
+
+**Datadog.** Integrations → Webhooks → New: URL `http://loki.example.com/alerts/datadog`
+and this payload (Datadog fills in the `$` variables):
+
+```json
+{
+  "id": "$ID",
+  "alert_id": "$ALERT_ID",
+  "title": "$EVENT_TITLE",
+  "alert_transition": "$ALERT_TRANSITION",
+  "alert_scope": "$ALERT_SCOPE",
+  "priority": "$ALERT_PRIORITY",
+  "tags": "$TAGS",
+  "date": "$DATE",
+  "body": "$EVENT_MSG"
+}
+```
+
+Then add `@webhook-<name>` to each monitor's message. The service is the `service:` tag
+(else `unknown`); `Recovered` resolves, `Warn` is a warning, anything else critical
+(or a `severity:` tag). One monitor alerting on several scopes is one incident per scope.
+
+**PagerDuty.** Integrations → Generic Webhooks (v3) → New Webhook, URL
+`http://loki.example.com/alerts/pagerduty`, events `incident.triggered` and
+`incident.resolved` (others are accepted and ignored). Copy the signing secret
+into `PAGERDUTY_WEBHOOK_SECRET`. The PagerDuty service's name is used as the service,
+so name them like your `service` labels. High urgency or P1/P2 is critical.
+
+**Anything else.** POST JSON to `/alerts/generic`:
+
+```json
+{"service": "payments-svc", "alert_name": "CheckoutErrors", "severity": "critical",
+ "summary": "checkout returns 500", "status": "firing"}
+```
+
+Only `alert_name` is required. `severity` is `critical|warning|info` (default `warning`),
+`status` is `firing|resolved` (default `firing`). Optional `fingerprint` (default
+`service:alert_name`) decides what counts as the same alert, and so what a `resolved` closes.
+
+**By hand.** "Something's wrong, Loki, look":
+
+```bash
+python3 scripts/investigate.py --service payments-svc --description "checkout failing"
+# or
+curl -X POST localhost:8088/investigations/manual -H 'Content-Type: application/json' \
+  -d '{"service": "payments-svc", "description": "checkout failing", "severity": "critical"}'
+```
+
+It opens an incident at once and starts an investigation (or joins the one already
+running for the current storm). Like any alert, the investigation waits about 25s for
+related alerts before it begins.
 
 ## Integrations
 

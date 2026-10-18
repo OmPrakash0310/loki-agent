@@ -15,6 +15,7 @@ from pydantic import BaseModel
 import auth
 import backtest
 import db
+import intake
 import investigator
 import slack
 import tools
@@ -80,41 +81,83 @@ def _run_after_grouping(inv_id: int):
             )
 
 
+def _start_investigation(inv_id: int):
+    threading.Thread(target=_run_after_grouping, args=(inv_id,), daemon=True).start()
+
+
+def _ingest(parse, payload) -> dict:
+    """Parse a provider payload into normalized alerts and run them through dedup and grouping."""
+    try:
+        alerts = parse(payload)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except (TypeError, AttributeError, KeyError) as e:  # a payload of the wrong shape
+        raise HTTPException(400, f"malformed payload: {type(e).__name__}: {e}")
+    with db.connect() as conn:
+        results = intake.ingest(conn, alerts, _attach_to_investigation, _start_investigation)
+    return {"ok": True, "alerts": results}
+
+
+async def _json(request: Request, body: bytes | None = None):
+    try:
+        return json.loads(body if body is not None else await request.body())
+    except ValueError:
+        raise HTTPException(400, "body is not valid JSON")
+
+
 @app.post("/alerts")
 async def receive_alerts(request: Request):
-    payload = await request.json()
-    with db.connect() as conn:
-        for alert in payload.get("alerts", []):
-            labels = alert["labels"]
-            fp = alert["fingerprint"]
-            if alert["status"] == "firing":
-                row = conn.execute(
-                    """
-                    INSERT INTO incidents (fingerprint, alert_name, service, severity, summary, started_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (fingerprint) WHERE status = 'open' DO NOTHING
-                    RETURNING id
-                    """,
-                    (fp, labels.get("alertname"), labels.get("service"), labels.get("severity"),
-                     alert.get("annotations", {}).get("summary"), alert["startsAt"]),
-                ).fetchone()
-                if not row:
-                    log.info("duplicate alert for open incident, fingerprint=%s", fp)
-                    continue
-                inv_id, created = _attach_to_investigation(conn, row["id"])
-                log.warning(
-                    "NEW incident #%s: %s on %s -> investigation #%s%s",
-                    row["id"], labels.get("alertname"), labels.get("service"), inv_id, " (new)" if created else " (grouped)",
-                )
-                if created:
-                    threading.Thread(target=_run_after_grouping, args=(inv_id,), daemon=True).start()
-            else:
-                conn.execute(
-                    "UPDATE incidents SET status='resolved', resolved_at=%s WHERE fingerprint=%s AND status='open'",
-                    (alert["endsAt"], fp),
-                )
-                log.info("resolved incident fingerprint=%s", fp)
-    return {"ok": True}
+    """Prometheus Alertmanager."""
+    return _ingest(intake.from_alertmanager, await _json(request))
+
+
+@app.post("/alerts/grafana")
+async def receive_grafana(request: Request):
+    return _ingest(lambda p: intake.from_alertmanager(p, "grafana"), await _json(request))
+
+
+@app.post("/alerts/sentry")
+async def receive_sentry(request: Request):
+    body = await request.body()
+    if not intake.verify_sentry(body, request.headers.get("Sentry-Hook-Signature", "")):
+        raise HTTPException(401, "bad sentry signature")
+    if request.headers.get("Sentry-Hook-Resource") == "installation":
+        return {"ok": True, "alerts": []}  # the integration being installed, not an alert
+    return _ingest(intake.from_sentry, await _json(request, body))
+
+
+@app.post("/alerts/datadog")
+async def receive_datadog(request: Request):
+    return _ingest(intake.from_datadog, await _json(request))
+
+
+@app.post("/alerts/pagerduty")
+async def receive_pagerduty(request: Request):
+    body = await request.body()
+    if not intake.verify_pagerduty(body, request.headers.get("X-PagerDuty-Signature", "")):
+        raise HTTPException(401, "bad pagerduty signature")
+    return _ingest(intake.from_pagerduty, await _json(request, body))
+
+
+@app.post("/alerts/generic")
+async def receive_generic(request: Request):
+    return _ingest(intake.from_generic, await _json(request))
+
+
+class ManualRequest(BaseModel):
+    service: str
+    description: str
+    severity: str | None = None
+
+
+@app.post("/investigations/manual")
+def manual_investigation(req: ManualRequest):
+    """"Something's wrong, Loki, look": opens an incident now and investigates it
+    (or adds it to the investigation already running for this storm)."""
+    if not req.description.strip():
+        raise HTTPException(400, "description must not be empty")
+    result = _ingest(lambda _: [intake.manual(req.service, req.description, req.severity)], None)
+    return result["alerts"][0]
 
 
 @app.get("/health")
