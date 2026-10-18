@@ -1,0 +1,43 @@
+2026-10-15 16:21:01,980 INFO payments-svc charged order=1041 amount=19.99
+INFO:     172.18.0.7:51234 - "POST /charge HTTP/1.1" 200 OK
+INFO:     172.18.0.7:51240 - "POST /charge HTTP/1.1" 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/site-packages/uvicorn/protocols/http/httptools_impl.py", line 401, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/starlette/routing.py", line 72, in app
+    response = await func(request)
+               ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/site-packages/fastapi/routing.py", line 278, in app
+    raw_response = await run_endpoint_function(
+  File "/app/main.py", line 51, in charge
+    currency = payload["currency"]  # KeyError -> 500
+               ~~~~~~~^^^^^^^^^^^^
+KeyError: 'currency'
+2026-10-15 16:21:02,001 ERROR payments-svc charge failed: KeyError: 'currency'
+2026-10-15 16:21:03,500 ERROR shop-api payment failed order=1042: payments-svc returned 500
+2026-10-15 16:21:04,010 ERROR shop-api payment failed order=1043: timeout calling payments-svc
+2026-10-15 16:21:04,200 WARNING shop-api retrying order=1043 after 250ms
+Traceback (most recent call last):
+  File "/app/db.py", line 12, in connect
+    return psycopg.connect(DB_URL)
+  File "/usr/local/lib/python3.12/site-packages/psycopg/connection.py", line 119, in connect
+    raise last_ex.with_traceback(None)
+psycopg.OperationalError: connection failed: connection to server at "10.0.0.5", port 5432 failed: Connection refused
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/app/main.py", line 60, in charge
+    conn = connect()
+RuntimeError: database unavailable
+  + Exception Group Traceback (most recent call last):
+  |   File "/app/batch.py", line 9, in run
+  |     raise ExceptionGroup("batch failed", errors)
+  | ExceptionGroup: batch failed (2 sub-exceptions)
+  +-+---------------- 1 ----------------
+    | ValueError: bad amount for order 1044
+    +---------------- 2 ----------------
+    | ValueError: bad amount for order 1045
+    +------------------------------------
