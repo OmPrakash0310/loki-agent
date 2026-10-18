@@ -72,6 +72,47 @@ Loki has to find a different kind of cause.
 
 `localhost:8088/stats` shows spend, cache hits and tokens per model.
 
+## Self-improvement
+
+Loki checks and learns, but only from things that are grounded. Self-critique
+with nothing to check against mostly agrees with itself (the "coherence trap"),
+and learning from your own unverified answers repeats your mistakes. So:
+
+**Critic (per investigation).** After Loki submits a report, one cheap call
+(`LOKI_CRITIC_MODEL`, Haiku by default) gets the report plus a numbered list of
+every tool result (step 0 is the briefing). It must mark the root cause and each
+evidence line *supported* (citing step numbers), *unsupported* or *contradicted*,
+through a single forced, strict-schema tool call. Then:
+
+- a "supported" claim that cites no real step counts as unsupported;
+- unsupported or contradicted evidence is dropped from the report and kept under
+  `report.critique.removed_evidence` for audit;
+- a contradiction lowers confidence by at least 0.2; the critic can never raise it;
+- on *revise*, the investigator gets one more round with the critic's notes (within
+  the same step and cost limits), then one re-critique. Never more.
+
+The report and Slack show one line, e.g. `Critic: 5/5 claims supported` or
+`Critic: 2 claims removed`. Critic calls are traced as `tool = critic` and count
+toward the investigation's cost. Cache hits skip it. Typical cost with Haiku:
+about 3-6k input and 300-600 output tokens, roughly $0.005-0.01 per call, so
+$0.005-0.02 per investigation including a revision round.
+
+**Lessons notebook.** Short, general lessons in the `lessons` table, created only from:
+
+- a human ❌ reject **with a reason** (`POST /investigations/<id>/reject {"reason": ...}`);
+- an eval miss: `scripts/eval.py` posts each run graded wrong to `POST /lessons/eval-miss`,
+  where a cheap model writes a 1-2 sentence lesson from the report vs. the ground truth.
+  Deploy ids, scenario names and other ground-truth values are scrubbed; the truth is never stored
+  (`--no-lessons` turns this off);
+- `POST /lessons {"text", "services", "tags"}` by a human.
+
+Loki's own unconfirmed reports never create lessons. Reject and eval-miss lessons
+start inactive: review them with `GET /lessons`, then `POST /lessons/<id>/approve`
+or `/disable`. Near-identical lessons are merged. Up to 3 active lessons matching
+the incident's services, alert names and error keywords go into the briefing under
+"Lessons from past mistakes (verified)". Backtests only see lessons created before
+the replay time. All of these endpoints use the normal API keys and audit log.
+
 ## Backtesting
 
 Replay a past incident and see what Loki would have said at the time: "give me
@@ -425,6 +466,10 @@ Set these in `.env` (see `.env.example`).
 | `LOKI_DAILY_BUDGET_USD` | `1.00` | Spending cap per day |
 | `LOKI_MAX_STEPS` | `8` | Model calls before Loki must report |
 | `LOKI_OLLAMA_URL` | | Point at Ollama to use a free local model |
+| `LOKI_CRITIC` | on for Claude, off for fake/Ollama | `1`/`0`: grounded critic after each report |
+| `LOKI_CRITIC_MODEL` | `claude-haiku-4-5` | Model for the critic (`fake` = free word-overlap critic) |
+| `LOKI_LESSONS` | `1` | Lessons notebook on/off |
+| `LOKI_LESSONS_MODEL` | `claude-haiku-4-5` | Phrases eval-miss lessons (`fake` = template) |
 | `SLACK_BOT_TOKEN` | | Slack app bot token; with `SLACK_CHANNEL`, reports get buttons |
 | `SLACK_CHANNEL` | | Channel to post reports in |
 | `SLACK_SIGNING_SECRET` | | Verifies button clicks come from Slack |

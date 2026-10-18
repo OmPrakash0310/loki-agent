@@ -14,6 +14,7 @@ import time
 import httpx
 from fastapi import HTTPException
 
+import critic
 import verifier
 
 log = logging.getLogger("agent")
@@ -80,6 +81,8 @@ def build_blocks(inv_id: int, r: dict, steps: int, cost: float) -> list[dict]:
         _section(f"*{_esc(r['summary'])}*"),
         _section(f"*Root cause* ({cause_where})\n{_esc(r['root_cause'])}"),
         _section("*Evidence*\n" + "\n".join(evidence)),
+        *([{"type": "context", "elements": [{"type": "mrkdwn", "text": _esc(critic.headline(r["critique"]))}]}]
+          if r.get("critique") else []),
         *_verification(v),
         _section(f"*Suggested action:* {_esc(r['suggested_action'])}\n{_esc(r['action_detail'])}"),
         {"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]},

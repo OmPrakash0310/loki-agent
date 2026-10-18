@@ -17,6 +17,7 @@ import backtest
 import db
 import intake
 import investigator
+import lessons
 import slack
 import tools
 from redact import redact
@@ -304,7 +305,14 @@ def _reject(inv_id: int, who: str | None = None, user_id: str | None = None, rea
             conn.execute("UPDATE report_cache SET confirmed = false WHERE exact_key = %s", (inv["cache_key"],))
         _record_feedback(conn, inv_id, "rejected", who, user_id, reason)
         _audit(conn, actor or f"slack:{who or user_id}", "reject", inv_id)
-    return {"rejected": inv_id}
+        # A human said it's wrong and why: a verified signal, so it may become a lesson (pending review).
+        lesson = None
+        if lessons.enabled() and (reason or "").strip():
+            try:
+                lesson = lessons.from_reject(conn, inv, reason, who or actor)
+            except Exception:
+                log.exception("could not record a lesson from the reject of #%s", inv_id)
+    return {"rejected": inv_id, **({"lesson": lesson} if lesson else {})}
 
 
 @app.post("/investigations/{inv_id}/confirm")
@@ -405,3 +413,83 @@ def run_backtest(req: BacktestRequest, request: Request):
     if inv["status"] == "done":
         inv["report_text"] = investigator.render(inv_id, inv["report"], inv["steps"], float(inv["cost_usd"]))
     return inv
+
+
+# ---------- lessons notebook (see lessons.py) ----------
+
+class LessonRequest(BaseModel):
+    text: str
+    services: list[str] = []
+    tags: list[str] = []
+
+
+class EvalMissRequest(BaseModel):
+    investigation_id: int
+    scenario: str | None = None
+    checks: dict[str, bool] = {}
+    truth: dict = {}  # used to phrase the lesson, never stored
+
+
+@app.get("/lessons")
+def list_lessons():
+    with db.connect() as conn:
+        return conn.execute(
+            "SELECT id, text, services, tags, source_investigation, created_from, confirmed_by, active, uses, created_at "
+            "FROM lessons ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+
+
+@app.post("/lessons")
+def add_lesson(req: LessonRequest, request: Request):
+    """A lesson a human wrote. Active at once: the human is the verification."""
+    try:
+        with db.connect() as conn:
+            out = lessons.create(conn, req.text, "manual", req.services, req.tags, None, request.state.actor)
+            _audit(conn, request.state.actor, f"lesson_add:{out['id']}", None)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return out
+
+
+@app.post("/lessons/eval-miss")
+def lesson_from_eval_miss(req: EvalMissRequest, request: Request):
+    """scripts/eval.py posts here when a run is graded wrong. The lesson starts inactive."""
+    if not lessons.enabled():
+        return {"skipped": "LOKI_LESSONS is off"}
+    if not req.checks or all(req.checks.values()):
+        raise HTTPException(400, "only a run graded wrong (some check false) can become a lesson")
+    with db.connect() as conn:
+        inv = _get_investigation(conn, req.investigation_id)
+        if inv["status"] != "done" or not inv["report"]:
+            raise HTTPException(409, "the investigation has no finished report")
+        text, cost = lessons.write_eval_lesson(inv["report"], req.truth, req.checks, req.scenario)
+        services, tags = lessons._scope(conn, inv["id"], inv["report"])
+        try:
+            out = lessons.create(conn, text, "eval_miss", services, tags, inv["id"])
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        _audit(conn, request.state.actor, f"lesson_eval_miss:{out['id']}", inv["id"])
+    return {**out, "text": text, "cost_usd": round(cost, 5)}
+
+
+def _set_lesson(lesson_id: int, active: bool, actor: str, action: str) -> dict:
+    with db.connect() as conn:
+        row = conn.execute(
+            "UPDATE lessons SET active = %s, confirmed_by = CASE WHEN %s THEN %s ELSE confirmed_by END "
+            "WHERE id = %s RETURNING id, active",
+            (active, active, actor, lesson_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "no such lesson")
+        _audit(conn, actor, f"{action}:{lesson_id}", None)
+    return row
+
+
+@app.post("/lessons/{lesson_id}/approve")
+def approve_lesson(lesson_id: int, request: Request):
+    return _set_lesson(lesson_id, True, request.state.actor, "lesson_approve")
+
+
+@app.post("/lessons/{lesson_id}/disable")
+def disable_lesson(lesson_id: int, request: Request):
+    return _set_lesson(lesson_id, False, request.state.actor, "lesson_disable")

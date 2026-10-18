@@ -11,6 +11,7 @@ table is written to evals/latest.md.
 import argparse
 import json
 import statistics
+import urllib.request
 from datetime import datetime, timezone
 
 import run_scenarios as rs
@@ -55,10 +56,25 @@ def grade(mode: str, report: dict, truth: dict) -> dict[str, bool]:
     raise ValueError(f"no grader for {mode}")
 
 
+def report_miss(mode: str, inv_id: int, checks: dict, truth: dict) -> dict | None:
+    """Send a run graded wrong to Loki, which turns it into a pending lesson (see agent/lessons.py).
+    The ground truth is used to phrase the lesson and is never stored. Errors are printed, not raised."""
+    body = json.dumps({"investigation_id": inv_id, "scenario": mode, "checks": checks, "truth": truth}).encode()
+    req = urllib.request.Request(rs.AGENT + "/lessons/eval-miss", data=body, method="POST",
+                                 headers={"Content-Type": "application/json", **rs.auth_headers()})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:  # a lesson is a bonus; never fail the eval over it
+        print(f"   (lesson not recorded: {e})", flush=True)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--scenarios", nargs="+", default=list(rs.EXPECTED))
+    parser.add_argument("--no-lessons", action="store_true", help="don't turn misses into pending lessons")
     args = parser.parse_args()
 
     started = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -76,12 +92,17 @@ def main():
                 row.update(correct=False, checks={}, error=(inv or {}).get("error") or "no report within 6 minutes")
             else:
                 full = rs.get(f"/investigations/{inv['id']}")
-                checks = grade(mode, full["report"], latest_truth(mode))
+                truth = latest_truth(mode)
+                checks = grade(mode, full["report"], truth)
                 row.update(
                     investigation=inv["id"], correct=all(checks.values()), checks=checks,
                     cost_usd=float(full["cost_usd"]), steps=full["steps"], cache=full.get("cache_hit"),
                     answer=full["report"]["summary"][:160],
                 )
+            if not row["correct"] and row.get("investigation") and not args.no_lessons:
+                lesson = report_miss(mode, row["investigation"], checks, truth)
+                if lesson and "id" in lesson:
+                    row["lesson"] = lesson["id"]
             rows.append(row)
             with results_file.open("a") as f:
                 f.write(json.dumps(row) + "\n")

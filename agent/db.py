@@ -101,6 +101,22 @@ CREATE TABLE IF NOT EXISTS audit_log (
     investigation_id INT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Lessons from verified mistakes only: a human reject with a reason, an eval miss
+-- graded against ground truth, or a manual entry. Never from Loki's own unconfirmed
+-- reports. Non-manual lessons start inactive until a human approves them.
+CREATE TABLE IF NOT EXISTS lessons (
+    id SERIAL PRIMARY KEY,
+    text TEXT NOT NULL,
+    services TEXT[] NOT NULL DEFAULT '{}',
+    tags TEXT[] NOT NULL DEFAULT '{}',
+    source_investigation INT REFERENCES investigations(id),
+    created_from TEXT NOT NULL CHECK (created_from IN ('reject', 'eval_miss', 'manual')),
+    confirmed_by TEXT,
+    active BOOLEAN NOT NULL DEFAULT false,
+    uses INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
