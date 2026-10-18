@@ -214,5 +214,25 @@
     "message": "Revert \"Support multi-currency charges\" (2a5f2f8)",
     "deployed_at": "2026-10-17T19:24:16.316296+00:00",
     "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n-    # Multi-currency: convert using the currency the shop sends\n-    currency = payload[\"currency\"]\n-    amount = payload[\"amount\"] * FX_RATES[currency]\n+    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
+  },
+  {
+    "id": "2e492fd",
+    "service": "payments-svc",
+    "version": "v2.5.0",
+    "author": "ravi",
+    "message": "Support multi-currency charges",
+    "deployed_at": "2026-10-18T06:17:10.873721+00:00",
+    "image": "loki-demo/payments-svc:v2.5.0",
+    "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n+    # Multi-currency: convert using the currency the shop sends\n+    currency = payload[\"currency\"]\n+    amount = payload[\"amount\"] * FX_RATES[currency]\n-    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
+  },
+  {
+    "id": "e583a27",
+    "service": "payments-svc",
+    "version": "v2.5.1",
+    "author": "ravi",
+    "message": "Revert \"Support multi-currency charges\" (2e492fd)",
+    "deployed_at": "2026-10-18T06:18:47.137471+00:00",
+    "image": "loki-demo/payments-svc:v2.5.1",
+    "diff": "--- a/payments-svc/charge.py\n+++ b/payments-svc/charge.py\n@@ -38,7 +38,10 @@ def charge(body: Charge):\n     log.debug(\"charging order %s\", body.order_id)\n     payload = body.model_dump()\n-    # Multi-currency: convert using the currency the shop sends\n-    currency = payload[\"currency\"]\n-    amount = payload[\"amount\"] * FX_RATES[currency]\n+    amount = payload[\"amount\"]\n     with psycopg.connect(DB_URL) as conn:\n         conn.execute(INSERT_PAYMENT, (body.order_id, amount))\n"
   }
 ]
