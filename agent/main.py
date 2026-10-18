@@ -151,13 +151,16 @@ class ManualRequest(BaseModel):
 
 
 @app.post("/investigations/manual")
-def manual_investigation(req: ManualRequest):
+def manual_investigation(req: ManualRequest, request: Request):
     """"Something's wrong, Loki, look": opens an incident now and investigates it
-    (or adds it to the investigation already running for this storm)."""
+    (or adds it to the investigation already running for this storm). Not under
+    /alerts, so the webhook token doesn't open it: it needs a key with write scope."""
     if not req.description.strip():
         raise HTTPException(400, "description must not be empty")
-    result = _ingest(lambda _: [intake.manual(req.service, req.description, req.severity)], None)
-    return result["alerts"][0]
+    result = _ingest(lambda _: [intake.manual(req.service, req.description, req.severity)], None)["alerts"][0]
+    with db.connect() as conn:
+        _audit(conn, request.state.actor, "manual", result["investigation_id"])
+    return result
 
 
 @app.get("/health")

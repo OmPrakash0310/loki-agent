@@ -1,11 +1,14 @@
 """Start an investigation by hand: "something's wrong, Loki, look".
 
+Set LOKI_API_KEY to a key with the write scope when Loki has LOKI_API_KEYS set.
+
 Usage:
     python3 scripts/investigate.py --service payments-svc --description "checkout failing"
     python3 scripts/investigate.py --service shop-api --description "slow pages" --severity critical --agent http://loki:8080
 """
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -26,8 +29,11 @@ def build_request(args) -> urllib.request.Request:
     body = {"service": args.service, "description": args.description}
     if args.severity:
         body["severity"] = args.severity
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("LOKI_API_KEY"):  # needs a key with the write scope
+        headers["Authorization"] = f"Bearer {os.environ['LOKI_API_KEY']}"
     return urllib.request.Request(f"{args.agent.rstrip('/')}/investigations/manual", data=json.dumps(body).encode(),
-                                  headers={"Content-Type": "application/json"}, method="POST")
+                                  headers=headers, method="POST")
 
 
 def main(argv=None) -> int:

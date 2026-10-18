@@ -116,6 +116,8 @@ class StatefulDB:
             return Rows([{"id": iid}])
         if "FROM investigations WHERE status IN" in sql:
             return Rows([{"id": self.investigations[-1]}] if self.investigations else [])
+        if "INSERT INTO audit_log" in sql:
+            self.audit = getattr(self, "audit", []) + [params]
         if "INSERT INTO investigations" in sql:
             self.investigations.append(len(self.investigations) + 1)
             return Rows([{"id": self.investigations[-1]}])
@@ -137,6 +139,8 @@ def api(monkeypatch):
     monkeypatch.setenv("SENTRY_PROJECTS", "payments=payments-svc")
     monkeypatch.delenv("SENTRY_WEBHOOK_SECRET", raising=False)
     monkeypatch.delenv("PAGERDUTY_WEBHOOK_SECRET", raising=False)
+    for var in ("LOKI_API_KEYS", "LOKI_WEBHOOK_TOKEN", "LOKI_REQUIRE_AUTH"):  # dev mode unless a test sets keys
+        monkeypatch.delenv(var, raising=False)
     fake.started = started
     return TestClient(main.app), fake  # not entered: no startup hook, no real database
 
@@ -336,9 +340,48 @@ def test_manual_trigger_validates(api):
     assert c.post("/investigations/manual", json={"service": "x"}).status_code == 422
 
 
-def test_cli_builds_the_request():
+def test_cli_builds_the_request(monkeypatch):
+    monkeypatch.delenv("LOKI_API_KEY", raising=False)
     args = investigate_cli.parse_args(["--service", "payments-svc", "--description", "checkout failing",
                                        "--agent", "http://loki:8080/"])
     req = investigate_cli.build_request(args)
     assert req.full_url == "http://loki:8080/investigations/manual" and req.get_method() == "POST"
     assert json.loads(req.data) == {"service": "payments-svc", "description": "checkout failing"}
+
+
+# ---------- with auth on ----------
+
+@pytest.fixture
+def secured(api, monkeypatch):
+    monkeypatch.setenv("LOKI_API_KEYS", "ops:w-key:read+write,viewer:r-key:read")
+    monkeypatch.setenv("LOKI_WEBHOOK_TOKEN", "hook-token")
+    return api
+
+
+def test_webhooks_need_the_token_and_signatures_still_apply(secured, monkeypatch):
+    c, fake = secured
+    assert c.post("/alerts/datadog", json=DATADOG).status_code == 401
+    assert c.post("/alerts/datadog?token=hook-token", json=DATADOG).status_code == 200
+    assert c.post("/alerts/generic", json=GENERIC, headers={"Authorization": "Bearer w-key"}).status_code == 200
+    monkeypatch.setenv("SENTRY_WEBHOOK_SECRET", "s3cret")
+    body = json.dumps(SENTRY_ISSUE).encode()
+    bad = c.post("/alerts/sentry?token=hook-token", content=body, headers={"Sentry-Hook-Signature": "nope"})
+    assert bad.status_code == 401
+    good = c.post("/alerts/sentry?token=hook-token", content=body, headers={"Sentry-Hook-Signature": _sign("s3cret", body)})
+    assert good.status_code == 200
+
+
+def test_manual_needs_a_write_key_and_is_audited(secured):
+    c, fake = secured
+    body = {"service": "payments-svc", "description": "checkout failing"}
+    assert c.post("/investigations/manual?token=hook-token", json=body).status_code == 401
+    assert c.post("/investigations/manual", json=body, headers={"Authorization": "Bearer r-key"}).status_code == 403
+    r = c.post("/investigations/manual", json=body, headers={"Authorization": "Bearer w-key"})
+    assert r.status_code == 200
+    assert fake.audit == [("ops", "manual", r.json()["investigation_id"])]
+
+
+def test_cli_sends_the_api_key(monkeypatch):
+    monkeypatch.setenv("LOKI_API_KEY", "w-key")
+    req = investigate_cli.build_request(investigate_cli.parse_args(["--service", "s", "--description", "d"]))
+    assert req.get_header("Authorization") == "Bearer w-key"

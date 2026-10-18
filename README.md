@@ -400,6 +400,11 @@ storm), and a resolved event closes the incident. A payload Loki can't read gets
 a 400 that says what is missing; an unknown service is accepted (as given, or
 `unknown`). Replace `loki.example.com` with where port 8088 is reachable.
 
+With auth on (see Securing Loki), append `?token=<LOKI_WEBHOOK_TOKEN>` to each
+`/alerts...` URL below, or send `Authorization: Bearer <key>` with a write-scoped key
+if the tool can set headers. Sentry and PagerDuty signatures are checked on top of
+that. `/investigations/manual` is not a webhook: it always needs a write-scoped key.
+
 | Source | URL | Signature check |
 |---|---|---|
 | Prometheus Alertmanager | `POST /alerts` | none |
@@ -476,9 +481,10 @@ Only `alert_name` is required. `severity` is `critical|warning|info` (default `w
 **By hand.** "Something's wrong, Loki, look":
 
 ```bash
-python3 scripts/investigate.py --service payments-svc --description "checkout failing"
+LOKI_API_KEY=<write key> python3 scripts/investigate.py --service payments-svc --description "checkout failing"
 # or
 curl -X POST localhost:8088/investigations/manual -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $LOKI_API_KEY" \
   -d '{"service": "payments-svc", "description": "checkout failing", "severity": "critical"}'
 ```
 
