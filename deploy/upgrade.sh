@@ -29,8 +29,8 @@ schema_ok() {
 }
 
 env_set LOKI_VERSION "$new"
-compose up -d agent
-if wait_ready "${LOKI_UPGRADE_TIMEOUT:-150}" && schema_ok; then
+# Everything after this point must reach the rollback below, so no `set -e` exits.
+if compose up -d agent && wait_ready "${LOKI_UPGRADE_TIMEOUT:-150}" && schema_ok; then
   log "upgrade to $new OK"
   exit 0
 fi
@@ -38,6 +38,6 @@ fi
 log "new version failed readiness or schema check; rolling back to $old"
 compose logs --tail 50 agent >&2 || true
 env_set LOKI_VERSION "$old"
-compose up -d agent
+compose up -d agent || true
 wait_ready 150 || die "ROLLBACK ALSO FAILED: restore the backup with restore.sh"
 die "upgrade failed, rolled back to $old (backup kept in $(env_get LOKI_BACKUP_DIR))"

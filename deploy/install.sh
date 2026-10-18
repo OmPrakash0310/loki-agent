@@ -115,6 +115,7 @@ fi
 [[ -n "$(env_get POSTGRES_PASSWORD)" ]] || env_set POSTGRES_PASSWORD "$(rand_hex 24)"
 [[ -n "$(env_get LOKI_API_KEYS)" ]] || env_set LOKI_API_KEYS "admin:$(rand_hex 32),mcp:$(rand_hex 32):read"
 [[ -n "$(env_get LOKI_WEBHOOK_TOKEN)" ]] || env_set LOKI_WEBHOOK_TOKEN "$(rand_hex 32)"
+[[ -n "$(env_get LOKI_LINK_SECRET)" ]] || env_set LOKI_LINK_SECRET "$(rand_hex 32)"
 [[ -n "$(env_get LOKI_PROBE_TOKEN)" ]] || env_set LOKI_PROBE_TOKEN "$(rand_hex 32)"
 
 # ---- 4. CLI + cron ----

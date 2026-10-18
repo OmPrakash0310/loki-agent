@@ -12,7 +12,7 @@
 		Permissions-Policy "interest-cohort=()"
 		-Server
 	}
-	@loki path /health /health/ready /alerts /alerts/* /investigations /investigations/* /incidents /stats /deploys/* /slack/interactions /lessons /lessons/* /backtest /backtest/*
+	@loki path /health /health/ready /alerts /alerts/* /investigations /investigations/* /incidents /stats /deploys/* /slack/interactions /lessons /lessons/* /backtest /backtest/* /share/*
 	handle @loki {
 		reverse_proxy agent:8080
 	}

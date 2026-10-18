@@ -6,7 +6,8 @@ FROM ${PYTHON_IMAGE} AS build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 RUN python -m venv /opt/venv
 COPY requirements.txt /tmp/requirements.txt
-RUN /opt/venv/bin/pip install -r /tmp/requirements.txt
+RUN /opt/venv/bin/pip install -r /tmp/requirements.txt \
+ && (/opt/venv/bin/pip uninstall -y pip setuptools wheel || true)
 
 # ---- runtime stage: no compilers, no pip cache, non-root ----
 FROM ${PYTHON_IMAGE}

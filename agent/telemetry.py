@@ -21,7 +21,11 @@ import metrics_config
 import sources
 from redact import redact
 
-LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100")
+# Grafana Loki (logs). Set it to empty (or "off") for a stack without Grafana Loki:
+# log queries then return nothing instead of failing the investigation.
+LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100").strip()
+if LOKI_URL.lower() in ("off", "none"):
+    LOKI_URL = ""
 # LOKI_PROM_URL wins when set. Set it to empty (or "off") for a stack without
 # Prometheus: the briefing then uses logs, errors and deploys only.
 PROM_URL = (os.environ["LOKI_PROM_URL"].strip() if "LOKI_PROM_URL" in os.environ
@@ -105,7 +109,7 @@ def fetch_logs(service: str | None, start: datetime, end: datetime, errors_only:
     selector = cfg.log_selector(service)
     query = selector + (" " + ERROR_FILTER if errors_only else "")
     end = _cap(end)
-    if start >= end:
+    if start >= end or not LOKI_URL:
         return []
     resp = httpx.get(
         f"{LOKI_URL}/loki/api/v1/query_range",
