@@ -208,6 +208,105 @@ It needs both images on the Docker host, the service's image to include
 service that needs only Postgres. Outside those limits expect `INCONCLUSIVE` or
 `NOT_REPRODUCED`: a missing confirmation is not evidence that the deploy is innocent.
 
+## Live probes
+
+Logs say *that* `charge()` raised `KeyError: 'currency'`; a live probe shows
+*what* `payload` held when it did. Loki places a non-breaking probe on one
+`file:line` of a running service, the service records the local variables the
+next few times that line runs, and Loki removes the probe again. Nothing is
+paused, nothing is redeployed, and the request still runs exactly as before
+(the same idea as Lightrun or Rookout snapshots).
+
+```
+capture_variables(service="payments-svc", file="main.py", line=68, variables=["payload"])
+→ {"hit_count": 1, "captures": [{"time": "...", "thread": "AnyIO worker thread",
+   "locals": {"payload": {"order_id": 4242, "amount": 499.0}}, "stack": ["main.py:68 in charge", ...]}]}
+```
+
+That is a real capture from payments-svc in `bad_deploy` mode: there's no
+`currency` key, so line 68 fails.
+
+**How it works.** The probe library (`probes/python/loki_probe`, no
+dependencies beyond Starlette for the endpoint) runs inside the service. On
+Python 3.12+ it uses `sys.monitoring` LINE events enabled only on the code
+objects that contain the probed line; older Pythons fall back to
+`sys.settrace`. The service mounts a small control API, `POST/GET/DELETE
+/_loki/probes`, and Loki's `capture_variables` tool calls it: place the probe,
+poll until it has hits (about 2s after the first hit) or the wait runs out,
+then delete it, on errors too.
+
+**Safety model.**
+- Off unless you turn it on, twice: the service only mounts the endpoint when
+  `LOKI_PROBE_TOKEN` is set (no token, no routes), and Loki only offers the tool
+  when `LOKI_PROBES=1` and `LOKI_PROBE_ENDPOINTS` names the service. Every
+  request needs the `X-Loki-Probe-Token` header (compared in constant time).
+- Read-only. No expressions are ever evaluated and no variable is ever set.
+  Values are rendered without calling the app's code: no custom `__repr__`,
+  `__eq__` or properties; other objects show their type and instance attributes.
+  The only filter is `{"variable": "order_id", "equals": 42}` on a local, compared
+  only when both sides are plain strings, numbers, booleans or null.
+- Bounded. 60s by default (300s cap), 20 hits by default (Loki asks for 5),
+  4 KB per hit and 64 KB per probe, nested values 3 levels deep, 20 items per
+  container, 200 characters per string, at most 5 probes at once. A timer removes
+  the probe at expiry even if Loki never comes back.
+- Never breaks the app. Every callback swallows its own errors and counts them;
+  a probe that fails 10 times removes itself.
+- Cheap. With no probe active nothing is hooked at all. With a probe active,
+  only its function is hooked: other lines in it are switched off after their
+  first call, and other functions pay nothing (benchmark: 74 ns per call with
+  no probe, 74 ns with a probe in another function, about 1.4 µs when the
+  probed line runs and a condition rejects it).
+- Scoped. Only `.py` files under `LOKI_PROBE_ROOTS` (default: the service's
+  working directory) can be probed; absolute paths, `../` escapes and
+  `site-packages` are refused.
+- Redacted twice. Variables and keys named like secrets (`password`, `token`,
+  `card`, `cvv`, `auth`, ...) are dropped, and strings go through the same
+  patterns as `agent/redact.py` (a test fails if the two copies drift). The
+  agent redacts the tool output again before the model sees it.
+- Accountable and budgeted. Every probe writes an `audit_log` row
+  (`probe:<service>:<file>:<line>`, actor `loki-agent`) *before* it is placed:
+  no audit row, no probe. The call and its output are in the investigation's
+  trace. Each investigation may place 3 probes (`LOKI_PROBE_MAX_PER_INVESTIGATION`)
+  and wait 120s in total, 60s per probe at most. Results are never cached.
+- Never in backtests: a probe reads the present, not the replayed past, so the
+  tool isn't offered (and refuses) during a replay.
+
+**Enable it.**
+
+```bash
+# .env (or your shell) for the demo stack
+LOKI_PROBE_TOKEN=<a long random string>   # payments-svc mounts /_loki/probes; the agent sends it
+LOKI_PROBES=1                             # the agent offers capture_variables
+# LOKI_PROBE_ENDPOINTS=payments-svc=http://payments-svc:8000   # the compose default
+docker compose up -d --build payments-svc agent
+```
+
+In your own service: copy or `pip install probes/python`, then
+`from loki_probe.http import mount; mount(app)` in a FastAPI/Starlette app. The
+payments-svc image gets the library from the `probes` build context in
+`docker-compose.yml`; a plain `docker build` (e.g.
+`scripts/build_payments_images.sh`) builds without it and the service runs as
+before.
+
+**Supported runtimes.** Python services (FastAPI/Starlette for the control
+endpoint; the core works in any Python process). Node is planned: the service
+would open its own inspector session in-process (`node:inspector`'s
+`Session.connect()`), call `Debugger.setBreakpointByUrl` with a condition that
+calls a fixed, non-mutating capture function and returns `false` so execution
+never pauses (a logpoint), serve results through the same `/_loki/probes` API and token, and remove the
+breakpoint at expiry. Same limits, same redaction patterns.
+
+**Limits.** The line must be inside a function that is already loaded
+(module-level code has run already). Values are captured just *before* the
+line runs, so a variable assigned on that line isn't there yet. Only traffic
+that reaches the line during the wait is seen: an idle path returns no hits.
+In a service with several worker processes a probe lives in the one process
+that served the request, so it only sees that process's traffic. On Python
+3.12+ the probe needs a free `sys.monitoring` tool slot and calls
+`sys.monitoring.restart_events()`, which can briefly re-arm events another
+tool had switched off. The settrace fallback only follows threads started after
+the probe and the thread that placed it.
+
 ## Useful endpoints
 
 - `localhost:8088/investigations`: all investigations, with status, steps and cost

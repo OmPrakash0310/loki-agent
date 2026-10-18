@@ -165,6 +165,16 @@ class FailedRequestSampler:
 
 app.add_middleware(FailedRequestSampler)
 
+# Live probes (probes/python/loki_probe): POST /_loki/probes lets Loki capture variables at a
+# line while the service runs. Only mounted when LOKI_PROBE_TOKEN is set; the image may not
+# include the library at all (scripts/build_payments_images.sh builds without it).
+try:
+    from loki_probe.http import mount as mount_probes
+except ImportError:
+    mount_probes = None
+if mount_probes and mount_probes(app):
+    log.info("live probe endpoint enabled at /_loki/probes")
+
 
 @app.post("/chaos")
 def set_chaos(body: ChaosMode):
