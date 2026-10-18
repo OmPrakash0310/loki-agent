@@ -161,6 +161,83 @@ Limits: the replay can only see what Grafana Loki and Prometheus still keep (ret
 deploys in `state/deploys.json`. If an earlier incident just before the replayed one isn't
 recorded in Loki's database, its leftover errors aren't cut off and can skew the rule-based suspects.
 
+## Evals and chaos engineer
+
+`python3 scripts/eval.py` still runs the original three `chaos.py` modes (bad_deploy, slow_db,
+timeout) with their original graders and table. Those are easy and all on one service, so there
+is also a larger, harder scenario set written by a "chaos engineer".
+
+**Faults.** Both demo services have a hidden `POST /chaos` switch (never logged, never counted
+in metrics, never held in a request handler's local variables, and never on the source line
+that raises an error, since tracebacks print it). `{"mode": ...}` keeps `chaos.py` working;
+`{"faults": {name: params}}` sets any combination of:
+
+| Fault | Service | What happens |
+|---|---|---|
+| `slow_db` | payments-svc | Postgres queries wait `seconds` (on a `rate` share of requests) |
+| `card_hang` | payments-svc | the card network hangs `seconds` |
+| `card_errors` | payments-svc | the card network answers `status` (5xx) on a `rate` share |
+| `risk_regression` | payments-svc | a code bug fails only charges >= `min_amount` (partial failure) |
+| `mem_leak` | payments-svc | receipt cache stops evicting: memory and latency creep (HighMemory alert) |
+| `amount_field` | shop-api | shop-api sends `amount_minor`; payments rejects with 422 (blame looks like payments) |
+| `payments_timeout_config` | shop-api | a config value makes the payments timeout `timeout_s` |
+| `bad_product` | shop-api | one product's catalog row has a NULL price: only its orders fail |
+| `cpu_burn` | shop-api | recommendation scoring burns CPU on every request |
+| `log_flood` | shop-api | unrelated error lines (analytics, recs cache) flood the logs |
+
+Any fault also takes `flap_s` to switch itself on and off (intermittent faults).
+
+**Scenarios.** `evals/scenarios/{train,heldout}/*.json` (format documented at the top of
+`scripts/scenario_spec.py`): faults and their timing, deploy records with real-looking diffs
+(culprits and innocent red herrings), extra load (steady, burst, ramp), a difficulty, and
+ground truth: the root-cause service, cause type, accepted `trigger` values, the culprit deploy
+(or none), acceptable answers, keywords, and what the trap is. They are generated:
+
+```bash
+python3 scripts/chaos_engineer.py            # 45 scenarios: 30 train, 15 held out (seeded, deterministic)
+python3 scripts/chaos_engineer.py --check    # fails if the committed files are stale
+LOKI_CHAOS_LLM=1 python3 scripts/chaos_engineer.py --llm 5   # optional: Claude proposes extra ones (costs money)
+```
+
+15 templates (payments bad deploy, partial deploy regression, shop-api deploy blamed on payments,
+config deploy, slow DB, innocent deploy just before a DB slowdown, card errors, card hang,
+DB slowness surfacing as upstream timeouts, memory leak, CPU pressure, bad record, flapping,
+two independent faults, log-noise flood) x 3 variants. The last variant of each goes to the held-out
+set, so every kind of incident is in both sets with different parameters; use train to tune Loki
+and held-out as the no-regression gate.
+
+**Running them.**
+
+```bash
+python3 scripts/eval.py --set train                       # 1 run each by default
+python3 scripts/eval.py --set heldout --difficulty hard --runs 2
+python3 scripts/eval.py --files evals/scenarios/train/s03-shop-bad-deploy-a.json
+python3 scripts/eval.py --set all --dry-run               # validate and list only
+```
+
+Each scenario is played by `scripts/scenario_runner.py` (deploys recorded in `state/deploys.json`,
+faults switched on schedule, culprit deploys reverted afterwards) and graded by one generic grader
+driven by the ground truth: right service, right cause type, right deploy (or none blamed), names
+the cause, right action where it matters, and "not fooled" by the trap. A scenario with two faults
+accepts either. The table in `evals/latest.md` adds accuracy, average partial score, times fooled,
+time and cost by difficulty, by fault type and by split.
+
+**Trying a scenario without Loki.** A small separate copy of the app (5 containers, ports 182xx):
+
+```bash
+docker compose -p loki-chaos -f evals/live/docker-compose.chaos.yml up -d --build
+python3 scripts/scenario_runner.py evals/scenarios/train/s13-card-flapping-a.json --hold 120 \
+    --shop-url http://localhost:18201 --payments-url http://localhost:18202 \
+    --deploys-file /tmp/chaos-deploys.json --ground-truth-file /tmp/chaos-truth.jsonl
+# Prometheus (metrics, alerts) on http://localhost:18290; logs with docker logs
+docker compose -p loki-chaos -f evals/live/docker-compose.chaos.yml down -v --rmi local
+```
+
+Limits: faults are simulated inside the services (the database is slowed with `pg_sleep`, the card
+network is a `sleep`), the memory leak needs extra load and a few minutes to cross the alert, and
+the grader matches services and keywords, so a right answer worded very differently can be
+marked wrong.
+
 ## Verification
 
 Loki doesn't stop at a guess. When it blames a deploy, the verifier tries to

@@ -84,9 +84,10 @@ def create_order():
     product = random.choice(PRODUCTS)
     product = CATALOG_ROWS.get(product["id"], product) if "bad_product" in SWITCHES else product
     _recommend(product)
-    # v1.9.0 sends amounts in minor units (the payments API still expects "amount").
-    payment = ({"order_id": order_id, "amount_minor": int(product["price"] * 100)} if "amount_field" in SWITCHES
-               else {"order_id": order_id, "amount": round(product["price"], 2)})
+    amount = round(product["price"], 2)
+    payment = {"order_id": order_id, "amount": amount}
+    if "amount_field" in SWITCHES:  # v1.9.0 sends minor units; the payments API still expects "amount"
+        payment = {"order_id": order_id, "amount_minor": int(amount * 100)}
     try:
         resp = httpx.post(
             f"{PAYMENTS_URL}/charge",

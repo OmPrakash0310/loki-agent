@@ -316,3 +316,35 @@ def test_log_formats_and_images_carry_no_switch():
                 assert "FAULTS" not in line and "SWITCHES" not in line and "CHAOS" not in line, line
     compose = (ROOT / "docker-compose.yml").read_text().lower()
     assert "chaos" not in compose and not re.search(r"\bfaults?\b", compose)
+
+
+def _traceback_of(fn, *args):
+    import traceback
+    try:
+        fn(*args)
+    except Exception:
+        return traceback.format_exc()
+    raise AssertionError("expected the fault to raise")
+
+
+def test_tracebacks_never_show_the_switch(payments, shop):
+    """Uncaught errors are logged with the source line that raised: it must not name
+    the switch (found in a live run: the card error's raise line read FAULTS[...])."""
+    svc, c = payments
+    texts = []
+    for faults, amount in (({"card_errors": {"rate": 1.0, "status": 502}}, 10),
+                           ({"risk_regression": {"min_amount": 100}}, 2999)):
+        set_faults(c, faults)
+        texts.append(_traceback_of(svc.charge, svc.Charge(order_id=1, amount=amount)))
+    assert "card network returned 502 Service Unavailable (authorize)" in texts[0]
+    c.post("/chaos", json={"mode": "bad_deploy"})
+    texts.append(_traceback_of(svc.charge, svc.Charge(order_id=1, amount=10)))
+    shop_svc, sc = shop
+    set_faults(sc, {"bad_product": {"product_id": 1}})
+    shop_svc.PRODUCTS[:] = [shop_svc.PRODUCTS[0]]  # always the broken product
+    texts.append(_traceback_of(shop_svc.create_order))
+    assert "NoneType" in texts[-1]
+    for text in texts:
+        text = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("File "))  # paths are ours
+        for word in ["FAULTS", "SWITCHES", "CHAOS", "chaos", *ss.FAULTS]:
+            assert word not in text, (word, text[-400:])

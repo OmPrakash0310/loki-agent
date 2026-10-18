@@ -52,9 +52,13 @@ DEPENDENCY = Histogram(
 CHAOS = {"mode": "none"}
 FAULTS: dict = {}
 SWITCHES: set = set()
-# Card network authorization errors seen by the client library.
 class CardNetworkError(Exception):
-    pass
+    """An error answer from the card network. Raised on a line of its own with a plain
+    message: tracebacks print the raising source line, so it must not name the switch."""
+
+    def __init__(self, operation):
+        super().__init__(f"card network returned {FAULTS.get('card_errors', {}).get('status', 503)} "
+                         f"Service Unavailable ({operation})")
 
 
 # Receipts are cached for idempotent retries. (The leak fault turns eviction off.)
@@ -107,8 +111,7 @@ def charge(body: Charge):
         time.sleep(5 if CHAOS["mode"] == "timeout" else
                    FAULTS["card_hang"].get("seconds", 5) if "card_hang" in SWITCHES else 0.03)
         if "card_errors" in SWITCHES and random.random() < FAULTS["card_errors"].get("rate", 1.0):
-            raise CardNetworkError(f"card network returned {FAULTS['card_errors'].get('status', 503)} "
-                                   "Service Unavailable (authorize)")
+            raise CardNetworkError("authorize")
 
     # The timer covers connecting too: when the database is struggling, the wait
     # often happens while opening the connection, not in the query.
