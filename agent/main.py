@@ -5,11 +5,12 @@ import json
 import logging
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 import auth
@@ -18,6 +19,7 @@ import db
 import intake
 import investigator
 import lessons
+import share
 import slack
 import tools
 from redact import redact
@@ -35,12 +37,9 @@ JOIN_WINDOW_S = 300
 
 # Secure by default: this dependency runs for every route, including ones added
 # later. Public paths are an explicit allowlist in auth.py.
-app = FastAPI(dependencies=[Depends(auth.require_auth)])
-auth.install_log_filter()
 _group_lock = threading.Lock()
 
 
-@app.on_event("startup")
 def startup():
     auth.check_startup()
     db.init()
@@ -52,6 +51,17 @@ def startup():
         ).fetchall()
     if orphaned:
         log.warning("marked %d orphaned investigation(s) as failed: %s", len(orphaned), [r["id"] for r in orphaned])
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    # on_event("startup") is deprecated in FastAPI; lifespan replaces it.
+    startup()
+    yield
+
+
+app = FastAPI(dependencies=[Depends(auth.require_auth)], lifespan=lifespan)
+auth.install_log_filter()
 
 
 def _attach_to_investigation(conn, incident_id: int) -> tuple[int, bool]:
@@ -114,7 +124,10 @@ async def receive_alerts(request: Request):
 
 @app.post("/alerts/grafana")
 async def receive_grafana(request: Request):
-    return _ingest(lambda p: intake.from_alertmanager(p, "grafana"), await _json(request))
+    body = await request.body()
+    if not intake.verify_grafana(body, request.headers):
+        raise HTTPException(401, "bad grafana signature")
+    return _ingest(lambda p: intake.from_alertmanager(p, "grafana"), await _json(request, body))
 
 
 @app.post("/alerts/sentry")
@@ -122,8 +135,9 @@ async def receive_sentry(request: Request):
     body = await request.body()
     if not intake.verify_sentry(body, request.headers.get("Sentry-Hook-Signature", "")):
         raise HTTPException(401, "bad sentry signature")
-    if request.headers.get("Sentry-Hook-Resource") == "installation":
-        return {"ok": True, "alerts": []}  # the integration being installed, not an alert
+    resource = request.headers.get("Sentry-Hook-Resource")
+    if resource and resource not in intake.SENTRY_ALERT_RESOURCES:
+        return {"ok": True, "alerts": []}  # e.g. the integration being installed, not an alert
     return _ingest(intake.from_sentry, await _json(request, body))
 
 
@@ -233,6 +247,28 @@ def trace(inv_id: int):
             "WHERE investigation_id = %s ORDER BY id",
             (inv_id,),
         ).fetchall()
+
+
+@app.get("/share/trace/{inv_id}", response_class=HTMLResponse, include_in_schema=False)
+def shared_trace(inv_id: int, exp: str = "", sig: str = ""):
+    """Read-only HTML of one investigation, opened from a signed link (Slack's "View trace").
+    auth.require_auth already checked the signature; checking again keeps this route safe
+    on its own."""
+    reason = share.verify(inv_id, exp, sig)
+    if reason:
+        raise HTTPException(403, reason)
+    with db.connect() as conn:
+        inv = _get_investigation(conn, inv_id)
+        steps = conn.execute(
+            "SELECT step, tool, input, left(output, 1500) AS output, created_at FROM trace_steps "
+            "WHERE investigation_id = %s ORDER BY id",
+            (inv_id,),
+        ).fetchall()
+    if inv["status"] == "done" and inv.get("report"):
+        text = investigator.render(inv["id"], inv["report"], inv["steps"], float(inv["cost_usd"]))
+    else:
+        text = f"Investigation #{inv['id']} is {inv['status']}."
+    return HTMLResponse(share.render_page(inv, text, steps, int(exp)), headers=share.HEADERS)
 
 
 def _redact_values(obj):

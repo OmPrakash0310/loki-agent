@@ -507,6 +507,8 @@ startup error instead.
 |---|---|
 | `LOKI_API_KEYS` | Comma-separated `name:key[:scopes]`, e.g. `eval:3f9a...,mcp:b71c...:read`. Scopes: `read`, `write`, `read+write` (default). A bare `key` works too. |
 | `LOKI_WEBHOOK_TOKEN` | Shared secret alert senders may pass as `?token=...` on any `/alerts` path. |
+| `LOKI_LINK_SECRET` | HMAC key for the Slack "View trace" share links (`GET /share/trace/{id}?exp=&sig=`). Unset: derived from `LOKI_API_KEYS` with a warning (rotating a key then breaks old links) |
+| `LOKI_LINK_TTL_S` | Share-link lifetime in seconds (default 604800, 7 days) |
 | `LOKI_REQUIRE_AUTH` | `1` = refuse to start without keys. |
 | `LOKI_API_KEY` | Client side: the key scripts and the MCP server send. |
 
@@ -585,6 +587,10 @@ are refused with 401.
 
 Note: `LOKI_PUBLIC_URL` exposes the agent's read endpoints (traces include log
 lines) to whoever can reach that URL. Put it behind your VPN or an auth proxy.
+The "View trace" button is a signed, expiring link (`/share/trace/{id}?exp=&sig=`)
+to a read-only HTML page for that one investigation, so it opens in a browser
+without an API key; anyone holding the link can read that page until it expires.
+A bad, tampered or expired signature gets 403.
 
 ## Supported languages
 
@@ -630,7 +636,7 @@ that. `/investigations/manual` is not a webhook: it always needs a write-scoped 
 | Source | URL | Signature check |
 |---|---|---|
 | Prometheus Alertmanager | `POST /alerts` | none |
-| Grafana alerting | `POST /alerts/grafana` | none |
+| Grafana alerting | `POST /alerts/grafana` | `GRAFANA_WEBHOOK_SECRET` (optional HMAC) |
 | Sentry | `POST /alerts/sentry` | `SENTRY_WEBHOOK_SECRET` |
 | Datadog | `POST /alerts/datadog` | none (Datadog webhooks are unsigned) |
 | PagerDuty | `POST /alerts/pagerduty` | `PAGERDUTY_WEBHOOK_SECRET` |
@@ -642,6 +648,9 @@ that. `/investigations/manual` is not a webhook: it always needs a write-scoped 
 | `SENTRY_PROJECTS` | `project-slug=service,...` (shared with the Sentry integration). An unmapped project's slug is used as the service |
 | `SENTRY_WEBHOOK_SECRET` | The internal integration's Client Secret. When set, a missing or wrong `Sentry-Hook-Signature` is rejected (401) |
 | `PAGERDUTY_WEBHOOK_SECRET` | The V3 webhook's signing secret. When set, a wrong `X-PagerDuty-Signature` is rejected (401) |
+| `GRAFANA_WEBHOOK_SECRET` | The webhook contact point's HMAC secret. When set, a wrong signature is rejected (401) |
+| `GRAFANA_WEBHOOK_SIGNATURE_HEADER` | Default `X-Grafana-Alerting-Signature` (Grafana's default) |
+| `GRAFANA_WEBHOOK_TIMESTAMP_HEADER` | Set to the contact point's timestamp header if you configured one; then `<ts>:<body>` is verified and requests older than 5 minutes are rejected |
 
 Severity is normalized to `critical`, `warning` or `info`.
 
@@ -652,6 +661,8 @@ and the `summary` annotation are used.
 **Grafana alerting.** Alerting → Contact points → New → Webhook, URL
 `http://loki.example.com/alerts/grafana`. Give alert rules a `service` label
 (else `service_name` or `job` is used, then `unknown`) and a `summary` annotation.
+Optionally set an HMAC secret on the contact point and the same value in
+`GRAFANA_WEBHOOK_SECRET`.
 
 **Sentry.** Settings → Developer Settings → Custom Integration → Internal Integration.
 Webhook URL `http://loki.example.com/alerts/sentry`, turn on **Alert Rule Action**,
@@ -660,7 +671,9 @@ rule add the action "Send a notification via <integration>"; in a metric alert, 
 it as the critical/warning action. Issue alerts open an incident per Sentry issue
 (Sentry sends no resolve for issue alerts, so that incident stays open and repeats of
 the same issue are deduplicated); metric alerts open on `critical`/`warning` and
-close on `resolved`. The service comes from `SENTRY_PROJECTS`.
+close on `resolved`. The service comes from `SENTRY_PROJECTS`. Webhooks whose
+`Sentry-Hook-Resource` is not `event_alert` or `metric_alert` (installation, issue,
+error, comment...) are acknowledged and ignored.
 
 **Datadog.** Integrations → Webhooks → New: URL `http://loki.example.com/alerts/datadog`
 and this payload (Datadog fills in the `$` variables):
@@ -671,6 +684,7 @@ and this payload (Datadog fills in the `$` variables):
   "alert_id": "$ALERT_ID",
   "title": "$EVENT_TITLE",
   "alert_transition": "$ALERT_TRANSITION",
+  "alert_type": "$ALERT_TYPE",
   "alert_scope": "$ALERT_SCOPE",
   "priority": "$ALERT_PRIORITY",
   "tags": "$TAGS",
@@ -680,12 +694,15 @@ and this payload (Datadog fills in the `$` variables):
 ```
 
 Then add `@webhook-<name>` to each monitor's message. The service is the `service:` tag
-(else `unknown`); `Recovered` resolves, `Warn` is a warning, anything else critical
-(or a `severity:` tag). One monitor alerting on several scopes is one incident per scope.
+(else `unknown`). `Recovered` resolves; `Warn`/`Re-Warn`, `No Data`/`Re-No Data` or
+`$ALERT_TYPE` `warning` are warnings; `Triggered`/`Re-Triggered`/`Renotify` are
+critical; a `severity:critical|warning|info` tag overrides. `$DATE` is epoch
+milliseconds. One monitor alerting on several scopes is one incident per scope.
+Variable names are from https://docs.datadoghq.com/integrations/webhooks/.
 
 **PagerDuty.** Integrations → Generic Webhooks (v3) → New Webhook, URL
-`http://loki.example.com/alerts/pagerduty`, events `incident.triggered` and
-`incident.resolved` (others are accepted and ignored). Copy the signing secret
+`http://loki.example.com/alerts/pagerduty`, events `incident.triggered`,
+`incident.reopened` and `incident.resolved` (others are accepted and ignored). Copy the signing secret
 into `PAGERDUTY_WEBHOOK_SECRET`. The PagerDuty service's name is used as the service,
 so name them like your `service` labels. High urgency or P1/P2 is critical.
 
@@ -769,9 +786,11 @@ skipped with a note.
 Run the tests (no Docker, no network):
 
 ```bash
-python3.12 -m venv .venv && .venv/bin/pip install httpx==0.27.2 pytest
-.venv/bin/pytest tests
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest
 ```
+
+`requirements-dev.txt` installs the agent, the MCP server and the test dependencies into
+one venv; they resolve together (no hand-pinned `starlette` needed).
 
 ## Using your own metrics
 

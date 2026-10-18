@@ -79,7 +79,8 @@ def test_build_blocks(monkeypatch):
     assert "4 steps" in footer and "$0.0123" in footer and "not verified by reproduction yet" in footer
     buttons = {e["action_id"]: e for e in blocks[6]["elements"]}
     assert buttons[slack.CONFIRM]["value"] == "12" and buttons[slack.REJECT]["value"] == "12"
-    assert buttons[slack.TRACE]["url"] == "https://loki.example.com/investigations/12/trace"
+    url = buttons[slack.TRACE]["url"]
+    assert url.startswith("https://loki.example.com/share/trace/12?exp=") and "&sig=" in url
 
 
 def test_build_blocks_without_public_url_has_no_trace_button(monkeypatch):

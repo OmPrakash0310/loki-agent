@@ -25,6 +25,9 @@ log = logging.getLogger("agent")
 PUBLIC_PATHS = {"/health", "/slack/interactions"}
 # Any path under this prefix also accepts LOKI_WEBHOOK_TOKEN as ?token=.
 WEBHOOK_PREFIX = "/alerts"
+# GET /share/trace/{id} needs no API key but must carry a valid signed ?exp=&sig=
+# (see share.py); a bad or expired signature is a 403 here, before any route runs.
+SHARE_METHODS = {"GET", "HEAD"}
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
 SCOPES = {"read", "write"}
 
@@ -94,6 +97,14 @@ def require_auth(request: Request):
     request.state.actor = "anonymous"
     if path in PUBLIC_PATHS:
         return
+    import share  # share imports auth
+    m = share.PATH_RE.fullmatch(path)
+    if m and request.method in SHARE_METHODS:
+        reason = share.verify(int(m.group(1)), request.query_params.get("exp", ""), request.query_params.get("sig", ""))
+        if reason:
+            raise HTTPException(403, reason)
+        request.state.actor = "share-link"
+        return
     keys = _keys()
     is_webhook = path == WEBHOOK_PREFIX or path.startswith(WEBHOOK_PREFIX + "/")
     if is_webhook:
@@ -117,7 +128,14 @@ def require_auth(request: Request):
     request.state.actor = key.name
 
 
-_TOKEN_RE = re.compile(r"(token=)[^&\s\"]+", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"((?:token|sig)=)[^&\s\"]+", re.IGNORECASE)
+
+
+def _redact_arg(a):
+    if isinstance(a, (int, float)) or a is None:
+        return a
+    text = a if isinstance(a, str) else str(a)  # e.g. an httpx URL object
+    return _TOKEN_RE.sub(r"\1***", text) if _TOKEN_RE.search(text) else a
 
 
 class RedactTokenFilter(logging.Filter):
@@ -125,12 +143,13 @@ class RedactTokenFilter(logging.Filter):
 
     def filter(self, record):
         if record.args:
-            record.args = tuple(_TOKEN_RE.sub(r"\1***", a) if isinstance(a, str) else a for a in record.args)
+            record.args = tuple(_redact_arg(a) for a in record.args)
         if isinstance(record.msg, str):
             record.msg = _TOKEN_RE.sub(r"\1***", record.msg)
         return True
 
 
 def install_log_filter():
-    for name in ("uvicorn.access", "uvicorn.error", "agent"):
+    # httpx/httpx2 log request URLs (httpx2 is what Starlette's TestClient uses).
+    for name in ("uvicorn.access", "uvicorn.error", "agent", "httpx", "httpx2"):
         logging.getLogger(name).addFilter(RedactTokenFilter())

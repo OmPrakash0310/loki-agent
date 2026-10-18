@@ -15,6 +15,7 @@ import httpx
 from fastapi import HTTPException
 
 import critic
+import share
 import verifier
 
 log = logging.getLogger("agent")
@@ -23,7 +24,8 @@ BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 CHANNEL = os.environ.get("SLACK_CHANNEL", "")
 SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-# Where people can reach the agent from a browser, for the "View trace" link.
+# Where people can reach the agent from a browser, for the "View trace" link
+# (a signed, expiring /share/trace link, so it opens without an API key).
 PUBLIC_URL = os.environ.get("LOKI_PUBLIC_URL", "").rstrip("/")
 
 # Slack resends old requests in replay attacks; refuse anything older than this.
@@ -73,7 +75,7 @@ def build_blocks(inv_id: int, r: dict, steps: int, cost: float) -> list[dict]:
          "text": {"type": "plain_text", "text": "❌ Wrong", "emoji": True}},
     ]
     if PUBLIC_URL:
-        buttons.append({"type": "button", "action_id": TRACE, "url": f"{PUBLIC_URL}/investigations/{inv_id}/trace",
+        buttons.append({"type": "button", "action_id": TRACE, "url": PUBLIC_URL + share.make_path(inv_id),
                         "text": {"type": "plain_text", "text": "View trace"}})
 
     return [

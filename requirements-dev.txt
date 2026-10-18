@@ -1,0 +1,7 @@
+# One venv for the whole test suite (agent + MCP server + tests), no Docker:
+#   python3.12 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest
+-r agent/requirements.txt
+-r mcp/requirements.txt
+pytest==9.1.1
+# tests/test_chaos_services.py imports the demo services, which export metrics.
+prometheus-client==0.21.0
