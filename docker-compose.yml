@@ -13,9 +13,12 @@ services:
       retries: 20
 
   payments-svc:
-    build: ./services/payments-svc
+    build:
+      context: ./services/payments-svc
+      additional_contexts: { probes: ./probes/python }  # the live-probe library (loki_probe)
     <<: *app-labels
-    environment: { DATABASE_URL: postgresql://app:app@postgres:5432/shop }
+    # Live probes stay off unless LOKI_PROBE_TOKEN is set in the environment (see README "Live probes").
+    environment: { DATABASE_URL: postgresql://app:app@postgres:5432/shop, LOKI_PROBE_TOKEN: "${LOKI_PROBE_TOKEN:-}" }
     ports: ["8002:8000"]
     depends_on: { postgres: { condition: service_healthy } }
 
@@ -77,6 +80,10 @@ services:
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       SLACK_CHANNEL: ${SLACK_CHANNEL:-}
+      # Live probes (off by default): LOKI_PROBES=1 plus the shared token offers capture_variables.
+      LOKI_PROBES: ${LOKI_PROBES:-0}
+      LOKI_PROBE_ENDPOINTS: ${LOKI_PROBE_ENDPOINTS:-payments-svc=http://payments-svc:8000}
+      LOKI_PROBE_TOKEN: ${LOKI_PROBE_TOKEN:-}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
       LOKI_PUBLIC_URL: ${LOKI_PUBLIC_URL:-}
       # Auth (see README "Securing Loki"). Empty = open, local demo only.

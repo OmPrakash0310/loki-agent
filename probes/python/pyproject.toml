@@ -1,0 +1,12 @@
+[project]
+name = "loki-probe"
+version = "0.1.0"
+description = "Non-breaking line probes for Loki: capture local variables at file:line in a running Python service"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+http = ["starlette"]
+
+[tool.setuptools]
+packages = ["loki_probe"]

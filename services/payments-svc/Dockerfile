@@ -1,4 +1,9 @@
+# Optional live-probe library. docker compose passes probes/python as the "probes" context;
+# a plain `docker build .` uses this empty stage and the image simply has no probes.
+FROM scratch AS probes
 FROM python:3.12-slim
+COPY --from=probes / /opt/probes/
+ENV PYTHONPATH=/opt/probes
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

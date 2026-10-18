@@ -1,14 +1,19 @@
 """The tools Loki's investigator can call. All of them are read-only."""
 import json
+import logging
+import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+import httpx
 
 import db
 import telemetry as tm
 from redact import redact
 
 MAX_OUTPUT_CHARS = 6000
+log = logging.getLogger("agent")
 
 TOOLS = [
     {
@@ -244,6 +249,162 @@ HANDLERS = {
 }
 
 
+# ---------- live probes (LOKI_PROBES=1) ----------
+# capture_variables places a non-breaking probe in a running service (probes/python/loki_probe),
+# waits briefly for the line to run, and always removes the probe again. Off unless
+# LOKI_PROBES=1 and LOKI_PROBE_ENDPOINTS is set; never offered in a backtest.
+
+CAPTURE_TOOL = {
+    "name": "capture_variables",
+    "description": (
+        "Capture local variable values at one line of code in a RUNNING service, for a few seconds, "
+        "without stopping or changing it (a non-breaking breakpoint). Use it only to confirm a hypothesis "
+        "about a bad value at a specific line you already found in a diff or stack trace (e.g. what "
+        "`payload` held when charge() failed). It waits for real traffic to hit the line. Don't use it "
+        "when logs already answer the question. Values are redacted and size-capped."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "service": {"type": "string", "description": "Service name, e.g. payments-svc."},
+            "file": {"type": "string", "description": "Path relative to the service's app directory, e.g. main.py."},
+            "line": {"type": "integer", "description": "Line number; values are captured just before it runs."},
+            "variables": {"type": "array", "items": {"type": "string"}, "description": "Local names to capture. Default: all locals."},
+            "seconds": {"type": "integer", "description": "How long to wait for hits. Default 20, max 60."},
+            "condition": {
+                "type": "object",
+                "description": "Only capture when a local equals a value, e.g. {\"variable\": \"order_id\", \"equals\": 42}.",
+                "properties": {"variable": {"type": "string"}, "equals": {"type": ["string", "number", "boolean", "null"]}},
+                "required": ["variable", "equals"],
+            },
+        },
+        "required": ["service", "file", "line"],
+    },
+}
+
+PROBE_MAX_WAIT_S = 60
+PROBE_MAX_HITS = 5
+PROBE_POLL_S = 0.5
+PROBE_GRACE_S = 2.0  # after the first hit, wait this long for more, then return
+# Per investigation: how many probes and how many seconds of waiting it may spend.
+PROBE_MAX_PER_INVESTIGATION = int(os.environ.get("LOKI_PROBE_MAX_PER_INVESTIGATION", "3"))
+PROBE_MAX_WAIT_PER_INVESTIGATION_S = 120
+
+
+def probe_endpoints() -> dict[str, str]:
+    """LOKI_PROBE_ENDPOINTS="payments-svc=http://payments-svc:8000,shop-api=http://shop-api:8000"."""
+    out = {}
+    for part in os.environ.get("LOKI_PROBE_ENDPOINTS", "").split(","):
+        name, _, url = part.partition("=")
+        if name.strip() and url.strip():
+            out[name.strip()] = url.strip().rstrip("/")
+    return out
+
+
+def probes_unavailable() -> str | None:
+    """Why capture_variables can't be used right now, or None if it can."""
+    if os.environ.get("LOKI_PROBES") != "1":
+        return "live probes are off (LOKI_PROBES is not 1)"
+    if not probe_endpoints():
+        return "no probe endpoints configured (LOKI_PROBE_ENDPOINTS)"
+    if tm.replay_time() is not None:
+        return "live probes are never used in a backtest: they would read the present, not the replayed past"
+    return None
+
+
+def available_tools() -> list[dict]:
+    """The tools to offer the model for this run."""
+    return TOOLS + [CAPTURE_TOOL] if probes_unavailable() is None else TOOLS
+
+
+def set_investigation(inv_id: int | None) -> None:
+    """Called at the start of each investigation: probes are audited and budgeted per investigation."""
+    _scope.inv_id = inv_id
+    _scope.probes = 0
+    _scope.probe_wait_s = 0.0
+
+
+def _audit_probe(service: str, file: str, line: int) -> None:
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (actor, action, investigation_id) VALUES (%s, %s, %s)",
+            ("loki-agent", f"probe:{service}:{file}:{line}", getattr(_scope, "inv_id", None)),
+        )
+
+
+def capture_variables(service, file, line, variables=None, seconds=20, condition=None):
+    why = probes_unavailable()
+    if why:
+        raise PermissionError(why)
+    base = probe_endpoints().get(service)
+    if base is None:
+        raise ValueError(f"no probe endpoint for {service!r}; known: {sorted(probe_endpoints())}")
+    used = getattr(_scope, "probes", 0)
+    waited = getattr(_scope, "probe_wait_s", 0.0)
+    if used >= PROBE_MAX_PER_INVESTIGATION or waited >= PROBE_MAX_WAIT_PER_INVESTIGATION_S:
+        raise PermissionError(f"probe budget for this investigation is used up ({used} probes, {waited:.0f}s)")
+    wait = min(_clip(seconds, 20, PROBE_MAX_WAIT_S), PROBE_MAX_WAIT_PER_INVESTIGATION_S - waited)
+    body = {"file": file, "line": line, "seconds": int(wait) + 5, "max_hits": PROBE_MAX_HITS}
+    if variables:
+        body["variables"] = list(variables)
+    if condition:
+        body["condition"] = condition
+    headers = {"X-Loki-Probe-Token": os.environ.get("LOKI_PROBE_TOKEN", "")}
+
+    _audit_probe(service, file, line)  # fail closed: no audit row, no probe
+    _scope.probes = used + 1
+    started = time.monotonic()
+    probe_id = None
+    try:
+        with httpx.Client(base_url=base, headers=headers, timeout=5) as http:
+            resp = http.post("/_loki/probes", json=body)
+            if resp.status_code != 201:
+                raise RuntimeError(f"probe rejected by {service} (HTTP {resp.status_code}): {resp.text[:300]}")
+            probe_id = resp.json()["id"]
+            log.warning("probe %s placed on %s %s:%s for %ss", probe_id, service, file, line, wait)
+            snap = resp.json()
+            first_hit = None
+            while time.monotonic() - started < wait:
+                time.sleep(PROBE_POLL_S)
+                snap = http.get(f"/_loki/probes/{probe_id}").json()
+                if snap.get("status") != "active":
+                    break
+                if snap.get("hit_count") and first_hit is None:
+                    first_hit = time.monotonic()
+                if first_hit is not None and time.monotonic() - first_hit >= PROBE_GRACE_S:
+                    break  # got something: a short grace for more hits, then stop
+            # Final read happens via DELETE, which also returns the hits.
+            final = http.delete(f"/_loki/probes/{probe_id}")
+            probe_id = None
+            if final.status_code == 200:
+                snap = final.json()
+    finally:
+        _scope.probe_wait_s = waited + (time.monotonic() - started)
+        if probe_id is not None:  # error mid-way: still remove the probe
+            try:
+                httpx.delete(f"{base}/_loki/probes/{probe_id}", headers=headers, timeout=5)
+            except Exception:
+                log.warning("could not remove probe %s on %s; it expires on its own", probe_id, service)
+    hits = snap.get("hits", [])
+    out = {
+        "service": service, "file": file, "line": line, "waited_seconds": round(time.monotonic() - started, 1),
+        "hit_count": len(hits),
+        "captures": [{"time": datetime.fromtimestamp(h["ts"], timezone.utc).isoformat(timespec="milliseconds"),
+                      "thread": h.get("thread"), "locals": h.get("locals"), "stack": h.get("stack")} for h in hits],
+    }
+    if not hits:
+        out["note"] = (f"the line did not run in {wait:.0f}s" + (" with the condition matching" if condition else "")
+                       + "; no traffic reached it, or the line number is wrong")
+    if snap.get("errors"):
+        out["probe_errors"] = snap["errors"]
+    return out
+
+
+HANDLERS["capture_variables"] = capture_variables
+# Live data that changes each call: never served from the cache.
+UNCACHED = {"capture_variables"}
+
+
 # Tool-result cache: the same query within TOOL_CACHE_TTL_S returns the saved
 # result instead of hitting Grafana Loki / Prometheus again. Errors aren't cached.
 TOOL_CACHE_TTL_S = 45
@@ -256,6 +417,8 @@ def run(name: str, args: dict) -> tuple[str, bool]:
     """Run a tool. Returns (output text, is_error)."""
     # The present is part of the key: a backtest must never get a live result (from
     # the future) back, and a live investigation must never get a stale backtest one.
+    if name in UNCACHED:
+        return _run_uncached(name, args)
     replay_at = tm.replay_time()
     key = name + json.dumps(args, sort_keys=True) + (replay_at.isoformat() if replay_at else "")
     with _tool_cache_lock:

@@ -69,6 +69,8 @@ mechanism (connection pools, memory leaks, cache effects) that no evidence shows
 and deploys that were already replaced or reverted, belong to earlier incidents and are not the cause.
 - If the briefing includes a similar past incident, check whether the same cause applies now \
 before reusing its conclusion.
+- If you have capture_variables, use it only to confirm a hypothesis about a bad value at a specific \
+line (e.g. a KeyError in a diff you read). Never use it when logs or the diff already answer the question.
 - You have read-only access. A human acts on your report.
 
 When you have enough evidence, call submit_report once. Only state facts you saw in the briefing or \
@@ -101,18 +103,18 @@ def _call(client, model: str, messages: list):
         return _fake_response(messages)
     if LOCAL:
         # Local open-source model through Ollama: plain request, no Claude-only extras.
-        return client.messages.create(model=model, max_tokens=8000, system=SYSTEM, tools=tools.TOOLS, messages=messages)
+        return client.messages.create(model=model, max_tokens=8000, system=SYSTEM, tools=tools.available_tools(), messages=messages)
     if model.startswith("claude-haiku"):
         # Haiku 4.5: no effort setting and no server-side fallbacks. Caching kicks in
         # once the prompt passes Haiku's 4,096-token minimum (later steps).
         return client.messages.create(
-            model=model, max_tokens=8000, system=SYSTEM, tools=tools.TOOLS, messages=messages,
+            model=model, max_tokens=8000, system=SYSTEM, tools=tools.available_tools(), messages=messages,
             cache_control={"type": "ephemeral"},
         )
     # Opus/Sonnet: adaptive thinking is on by default. fallbacks="default" re-runs a
     # request on Anthropic's recommended model if the safety classifiers decline it.
     return client.beta.messages.create(
-        model=model, max_tokens=16000, system=SYSTEM, tools=tools.TOOLS, messages=messages,
+        model=model, max_tokens=16000, system=SYSTEM, tools=tools.available_tools(), messages=messages,
         cache_control={"type": "ephemeral"},
         output_config={"effort": "high"},
         betas=["server-side-fallback-2026-07-01"],
@@ -261,6 +263,7 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
         ).fetchone()["t"]
         floor = min(prev, first_alert - timedelta(seconds=90)) if prev else None
         tools.set_window_floor(floor)
+        tools.set_investigation(inv_id)
         briefing = context.build(incidents, floor)
         conn.execute(
             "UPDATE investigations SET fingerprint = %s, cache_key = %s WHERE id = %s",
