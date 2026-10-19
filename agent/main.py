@@ -35,6 +35,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # don't log every telemetr
 GROUP_WINDOW_S = 25
 # A new alert joins an investigation created within this many seconds.
 JOIN_WINDOW_S = 300
+# After a restart, live investigations younger than this are run again instead of failed.
+RESUME_WINDOW_S = 1800
 
 # Secure by default: this dependency runs for every route, including ones added
 # later. Public paths are an explicit allowlist in auth.py.
@@ -45,14 +47,33 @@ def startup():
     auth.check_startup()
     db.init()
     # Investigations run in background threads; a restart kills them. Don't leave them hanging.
+    requeued = []
     with db.connect() as conn:
-        orphaned = conn.execute(
-            "UPDATE investigations SET status = 'failed', finished_at = now(), error = 'agent restarted mid-investigation' "
-            "WHERE status IN ('queued', 'running') RETURNING id"
+        # A restart (deploy, crash, reboot) kills the background threads. A live investigation that
+        # started recently is run again from scratch (its partial trace is dropped) instead of being
+        # lost; older ones, backtests, and ones already restarted once are marked failed.
+        orphans = conn.execute(
+            "SELECT id, mode, (created_at > now() - make_interval(secs => %s)) AS recent, restarts "
+            "FROM investigations WHERE status IN ('queued', 'running')", (RESUME_WINDOW_S,),
         ).fetchall()
+        failed = []
+        for o in orphans:
+            if o["mode"] == "live" and o["recent"] and o["restarts"] < 1:
+                conn.execute("DELETE FROM trace_steps WHERE investigation_id = %s", (o["id"],))
+                conn.execute("UPDATE investigations SET status = 'queued', restarts = restarts + 1 WHERE id = %s", (o["id"],))
+                requeued.append(o["id"])
+            else:
+                conn.execute(
+                    "UPDATE investigations SET status = 'failed', finished_at = now(), "
+                    "error = 'agent restarted mid-investigation' WHERE id = %s", (o["id"],))
+                failed.append(o["id"])
     selfmon.start()
-    if orphaned:
-        log.warning("marked %d orphaned investigation(s) as failed: %s", len(orphaned), [r["id"] for r in orphaned])
+    for inv_id in requeued:
+        _start_investigation(inv_id)
+    if requeued:
+        log.warning("re-queued %d investigation(s) interrupted by a restart: %s", len(requeued), requeued)
+    if failed:
+        log.warning("marked %d orphaned investigation(s) as failed: %s", len(failed), failed)
 
 
 @asynccontextmanager

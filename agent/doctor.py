@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from sources import httpkit
+
 OK, WARN, FAIL = "✅", "⚠️", "❌"
 
 
@@ -91,7 +93,8 @@ def check_prometheus(client) -> Result:
     url = _env("LOKI_PROM_URL") if "LOKI_PROM_URL" in os.environ else _env("PROM_URL")
     if not url or url.lower() in ("off", "none"):
         return Result(WARN, "prometheus", "not configured (briefings use logs, errors, deploys only)")
-    _, err = _get(client, "prometheus", f"{url.rstrip('/')}/api/v1/query", params={"query": "1"})
+    _, err = _get(client, "prometheus", f"{url.rstrip('/')}/api/v1/query", params={"query": "1"},
+                  headers=httpkit.auth_headers("PROM"))
     return err or Result(OK, "prometheus", url)
 
 
@@ -101,7 +104,8 @@ def check_grafana_loki(client) -> Result:
         if (_env("LOKI_ERRORS_SOURCE") or "loki") == "loki":
             return Result(WARN, "grafana loki", "LOKI_URL not set but errors source is loki")
         return Result(WARN, "grafana loki", "not configured")
-    _, err = _get(client, "grafana loki", f"{url.rstrip('/')}/loki/api/v1/labels")
+    _, err = _get(client, "grafana loki", f"{url.rstrip('/')}/loki/api/v1/labels",
+                  headers=httpkit.auth_headers("LOGS"))
     return err or Result(OK, "grafana loki", url)
 
 
