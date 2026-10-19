@@ -134,13 +134,13 @@ def query_logs(service=None, contains=None, minutes=20, errors_only=True):
     errors_only = errors_only is not False
     if errors_only:
         lines = tm.error_lines(service or None, _since(m), tm.now())
-    else:  # full logs only exist in Grafana Loki
-        lines = tm.fetch_logs(service or None, _since(m), tm.now(), False)
+    else:  # full logs: Datadog when it is the errors source, otherwise Grafana Loki
+        lines = tm.log_lines(service or None, _since(m), tm.now())
     if contains:
         lines = [l for l in lines if contains.lower() in l[2].lower()]
     clusters = tm.cluster_logs(lines)
     out = {"window_minutes": m, "matching_lines": len(lines), "patterns": clusters}
-    notes = tm.error_notes() if errors_only else []
+    notes = tm.error_notes()
     return {**out, "notes": notes} if notes else out
 
 

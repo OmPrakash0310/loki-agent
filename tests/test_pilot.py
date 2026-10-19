@@ -34,7 +34,8 @@ GOOD = {
     "LOKI_OPERATOR_SLACK_WEBHOOK": "https://hooks.slack.com/services/T/B/x",
 }
 ENV_NAMES = set(GOOD) | {"PROM_URL", "LOKI_VERIFY", "LOKI_PROBES", "SLACK_WEBHOOK_URL", "LOKI_OLLAMA_URL",
-                         "GITHUB_API_URL", "SENTRY_BASE_URL"}
+                         "GITHUB_API_URL", "SENTRY_BASE_URL",
+                         "DATADOG_API_KEY", "DATADOG_APP_KEY", "DATADOG_TOKEN", "DATADOG_SITE", "DATADOG_BASE_URL"}
 
 
 @pytest.fixture
@@ -92,8 +93,10 @@ def run(overrides=None, calls=None):
 def test_doctor_all_green(env):
     calls = []
     res = run(calls=calls)
-    bad = {n: r for n, r in res.items() if r.status != doctor.OK}
+    # Datadog is an alternative to Sentry/Grafana Loki: its warning is expected when it isn't used.
+    bad = {n: r for n, r in res.items() if r.status != doctor.OK and n != "datadog"}
     assert not bad, bad
+    assert res["datadog"].status == doctor.WARN
     # Read-only: only GETs, plus Slack's auth.test.
     assert all(m == "GET" or "auth.test" in u for m, u in calls)
     assert any("api.anthropic.com/v1/models" in u for _, u in calls)  # the free models list, no messages call

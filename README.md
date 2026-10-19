@@ -27,7 +27,7 @@ Inside `agent/`:
 | `metrics_config.py` | Which metric and log label names to query (presets, `LOKI_METRICS_CONFIG`) |
 | `slack.py` | Slack reports with Confirm / Wrong / View trace buttons |
 | `verifier.py` | Proves a blamed deploy by reproducing the failure in a sandbox (see Verification) |
-| `sources/` | Pluggable deploy and error sources: JSON file, Grafana Loki, GitHub, Sentry |
+| `sources/` | Pluggable deploy and error sources: JSON file, Grafana Loki, GitHub, Sentry, Datadog logs |
 | `redact.py` | Removes secrets and personal data before anything reaches the model |
 
 ## Deploying for a customer (pilot)

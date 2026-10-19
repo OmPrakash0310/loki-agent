@@ -4,7 +4,7 @@ Picked by env vars, so the same agent can investigate the demo stack or a real
 team's stack:
 
     LOKI_DEPLOYS_SOURCE = file (default) | github
-    LOKI_ERRORS_SOURCE  = loki (default) | sentry
+    LOKI_ERRORS_SOURCE  = loki (default) | sentry | datadog
 
 Metrics always come from Prometheus (telemetry.py).
 """
@@ -44,7 +44,11 @@ def errors():
         from sources.sentry import SentryErrors
         key = ("errors", "sentry", os.environ.get("SENTRY_ORG", ""), os.environ.get("SENTRY_PROJECTS", ""))
         return _cached(key, SentryErrors.from_env)
-    raise ValueError(f"unknown LOKI_ERRORS_SOURCE {kind!r}; use loki or sentry")
+    if kind == "datadog":
+        from sources.datadog import DatadogErrors
+        key = ("errors", "datadog", os.environ.get("DATADOG_SITE", ""), os.environ.get("DATADOG_LOG_QUERY", ""))
+        return _cached(key, DatadogErrors.from_env)
+    raise ValueError(f"unknown LOKI_ERRORS_SOURCE {kind!r}; use loki, sentry or datadog")
 
 
 def reset() -> None:

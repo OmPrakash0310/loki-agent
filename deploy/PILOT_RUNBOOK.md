@@ -123,7 +123,12 @@ All of these live in `loki.env`. Run `loki restart && loki doctor` after each ch
   It needs read-only *Metadata*, *Contents*, *Deployments* and *Pull requests*, with an expiry date
   (set a reminder). Set `GITHUB_TOKEN`, `GITHUB_REPOS=owner/repo=service,...`, optionally
   `GITHUB_ENVIRONMENT=production`, and `LOKI_DEPLOYS_SOURCE=github`. Doctor warns on a classic token with `repo` scope, which grants write.
-- **Datadog and PagerDuty** are alert intake only. Loki does not read Datadog metrics or logs.
+- **Datadog logs.** In Datadog: Organization Settings → API Keys (copy one) and Application Keys → New Key with the
+  `logs_read_data` permission only. Set `DATADOG_API_KEY`, `DATADOG_APP_KEY`, `DATADOG_SITE` (e.g. `datadoghq.eu` if
+  their URL isn't `app.datadoghq.com`) and `LOKI_ERRORS_SOURCE=datadog`. Optional `DATADOG_LOG_QUERY=env:production`.
+  Loki reads error logs and searches full logs through the Logs Search API. **Not yet tested against a live Datadog
+  account**: run `loki doctor` and the smoke test below before relying on it.
+- **Datadog metrics and PagerDuty** are alert intake only. Loki does not read Datadog metrics.
 - **Model.** Set `ANTHROPIC_API_KEY` and keep `LOKI_MODEL=claude-haiku-4-5` to start. Doctor checks the
   key with the free models list.
 
@@ -227,7 +232,7 @@ request bodies at 1 MB and sets HSTS, CSP, nosniff, frame-deny and no-referrer h
 
 - **One instance per customer.** There is no multi-tenancy and no HA. A VPS outage means missed alerts until it is back.
   Alertmanager retries, but most SaaS webhooks do not.
-- Datadog and PagerDuty are intake only. No Datadog metrics or logs are read.
+- Datadog metrics and PagerDuty are intake only. Datadog logs are read through the Logs Search API (untested live).
 - Investigations run in-process. After a restart, live ones started in the last 30 minutes are run again
   from scratch (once); older ones are marked failed.
 - Backups are plain `pg_dump` (no point-in-time recovery), so up to 24 hours of reports can be lost.
