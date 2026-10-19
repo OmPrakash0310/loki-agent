@@ -13,7 +13,7 @@ write_files:
       LOKI_DOMAIN=loki.customer.example.com
       LOKI_ACME_EMAIL=ops@example.com
       LOKI_VERSION=0.1.0
-      LOKI_REPO=https://github.com/TurboTrade-TT/incident-agent.git
+      LOKI_REPO=https://github.com/OmPrakash0310/loki-agent.git
 runcmd:
   - [bash, -c, "ufw allow OpenSSH && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable"]
   - [bash, -c, "set -a; . /root/loki-install.env; set +a; git clone --depth 1 --branch v$LOKI_VERSION $LOKI_REPO /opt/loki-src"]

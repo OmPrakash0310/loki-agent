@@ -9,7 +9,7 @@
 #   --email E           Let's Encrypt e-mail
 #   --anthropic-key K   model API key (or set ANTHROPIC_API_KEY in the environment)
 #   --model M           default claude-haiku-4-5 (fake = testing only)
-#   --image I           default ghcr.io/turbotrade-tt/loki-agent
+#   --image I           default ghcr.io/omprakash0310/loki-agent
 #   --version V         image tag, default 0.1.0
 #   --build             build the image from ../agent instead of pulling
 #   --dir DIR           install directory, default /opt/loki
@@ -22,7 +22,7 @@ set -euo pipefail
 src="$(dirname "$(readlink -f "$0")")"
 
 domain="" email="" akey="${ANTHROPIC_API_KEY:-}" model="claude-haiku-4-5"
-image="ghcr.io/turbotrade-tt/loki-agent" version="0.1.0"
+image="ghcr.io/omprakash0310/loki-agent" version="0.1.0"
 build=0 install_docker=1 start=1 cron=1 yes=0
 dir="/opt/loki" project="loki"
 

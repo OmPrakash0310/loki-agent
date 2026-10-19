@@ -27,7 +27,7 @@ services:
     <<: *logging
 
   agent:
-    image: ${LOKI_IMAGE:-ghcr.io/turbotrade-tt/loki-agent}:${LOKI_VERSION:?set LOKI_VERSION in loki.env}
+    image: ${LOKI_IMAGE:-ghcr.io/omprakash0310/loki-agent}:${LOKI_VERSION:?set LOKI_VERSION in loki.env}
     restart: unless-stopped
     env_file: [loki.env]
     environment:
