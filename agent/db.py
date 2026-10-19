@@ -47,6 +47,7 @@ ALTER TABLE investigations ADD COLUMN IF NOT EXISTS cache_hit TEXT;
 -- (replay_at). Backtests are kept out of /stats, the answer cache and past-incident search.
 ALTER TABLE investigations ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'live';
 ALTER TABLE investigations ADD COLUMN IF NOT EXISTS replay_at TIMESTAMPTZ;
+ALTER TABLE investigations ADD COLUMN IF NOT EXISTS restarts INT NOT NULL DEFAULT 0;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'live';
 
 -- Loki's answer cache. exact_key = incident fingerprint + suspect deploy, so a

@@ -19,6 +19,7 @@ import httpx
 import logparse
 import metrics_config
 import sources
+from sources import httpkit
 from redact import redact
 
 # Grafana Loki (logs). Set it to empty (or "off") for a stack without Grafana Loki:
@@ -33,6 +34,13 @@ PROM_URL = (os.environ["LOKI_PROM_URL"].strip() if "LOKI_PROM_URL" in os.environ
 if PROM_URL.lower() in ("off", "none"):
     PROM_URL = ""
 DEPLOYS_FILE = os.environ.get("DEPLOYS_FILE", "/state/deploys.json")
+
+
+def _get(kind: str, url: str, **kw):
+    headers = httpkit.auth_headers(kind)
+    if headers:
+        kw["headers"] = headers
+    return httpx.get(url, **kw)
 
 # Keep log lines that report a problem, plus exception summaries such as
 # "KeyError: 'currency'" or "java.lang.IllegalStateException: ...", "Caused by:"
@@ -111,8 +119,8 @@ def fetch_logs(service: str | None, start: datetime, end: datetime, errors_only:
     end = _cap(end)
     if start >= end or not LOKI_URL:
         return []
-    resp = httpx.get(
-        f"{LOKI_URL}/loki/api/v1/query_range",
+    resp = _get(
+        "LOGS", f"{LOKI_URL}/loki/api/v1/query_range",
         params={"query": query, "start": _ns(start), "end": _ns(end), "limit": limit, "direction": "backward"},
         timeout=20,
     )
@@ -246,7 +254,7 @@ def _metric_names() -> frozenset | None:
         if hit and time.monotonic() - hit[0] < NAMES_TTL_S:
             return hit[1]
     try:
-        resp = httpx.get(f"{PROM_URL}/api/v1/label/__name__/values", timeout=10)
+        resp = _get("PROM", f"{PROM_URL}/api/v1/label/__name__/values", timeout=10)
         resp.raise_for_status()
         names = frozenset(resp.json()["data"])
     except Exception:
@@ -302,7 +310,7 @@ def services() -> list[str]:
     cfg = _cfg()
     match = cfg.services_match()
     params = {"match[]": match, **_label_window()} if match else _label_window()
-    resp = httpx.get(f"{PROM_URL}/api/v1/label/{cfg.service_label}/values", params=params, timeout=10)
+    resp = _get("PROM", f"{PROM_URL}/api/v1/label/{cfg.service_label}/values", params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()["data"]
 
@@ -314,7 +322,8 @@ def metric_series(metric: str, service: str, start: datetime, end: datetime, ste
     end = _cap(end)
     if start > end:
         return []
-    resp = httpx.get(
+    resp = _get(
+        "PROM",
         f"{PROM_URL}/api/v1/query_range",
         params={"query": query, "start": start.timestamp(), "end": end.timestamp(), "step": step_s},
         timeout=20,
@@ -345,7 +354,8 @@ def metric_at(metric: str, service: str, at: datetime):
     if metric_unavailable(metric):
         return None
     at = _cap(at)
-    resp = httpx.get(
+    resp = _get(
+        "PROM",
         f"{PROM_URL}/api/v1/query",
         params={"query": _cfg().promql(metric, service), "time": at.timestamp()},
         timeout=10,
@@ -364,7 +374,7 @@ def dependency_p95_at(service: str, at: datetime) -> dict[str, float]:
         return {}
     cfg = _cfg()
     at = _cap(at)
-    resp = httpx.get(f"{PROM_URL}/api/v1/query", params={"query": cfg.dependency_promql(service), "time": at.timestamp()}, timeout=10)
+    resp = _get("PROM", f"{PROM_URL}/api/v1/query", params={"query": cfg.dependency_promql(service), "time": at.timestamp()}, timeout=10)
     resp.raise_for_status()
     out = {}
     for r in resp.json()["data"]["result"]:
@@ -381,7 +391,8 @@ def dependency_p95_series(service: str, start: datetime, end: datetime, step_s: 
     end = _cap(end)
     if start > end:
         return {}
-    resp = httpx.get(
+    resp = _get(
+        "PROM",
         f"{PROM_URL}/api/v1/query_range",
         params={"query": cfg.dependency_promql(service), "start": start.timestamp(), "end": end.timestamp(), "step": step_s},
         timeout=20,
@@ -398,7 +409,7 @@ def services_with_dependencies() -> list[str]:
     if dependency_unavailable():
         return []
     cfg = _cfg()
-    resp = httpx.get(f"{PROM_URL}/api/v1/label/{cfg.service_label}/values",
+    resp = _get("PROM", f"{PROM_URL}/api/v1/label/{cfg.service_label}/values",
                      params={"match[]": f"{cfg.dependency_histogram}_count", **_label_window()}, timeout=10)
     resp.raise_for_status()
     return resp.json()["data"]

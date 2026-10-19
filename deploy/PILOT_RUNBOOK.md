@@ -111,8 +111,9 @@ All of these live in `loki.env`. Run `loki restart && loki doctor` after each ch
   work if they serve `/api/v1/query`. Find the right preset from your laptop:
   `python scripts/discover_metrics.py --prom <url>`. Then set `LOKI_METRICS_PRESET`
   (`default|otel|spring|express-prom`). For a custom JSON, mount it into the agent and set `LOKI_METRICS_CONFIG` to its path in the container.
-  **Limit:** Loki sends no auth header to Prometheus or Grafana Loki. Use a URL reachable from the
-  VPS without auth (a VPN or allowlisted IP), or put an authenticating reverse proxy in front.
+  **Auth:** if the endpoint needs credentials, set `LOKI_PROM_BEARER_TOKEN`, or `LOKI_PROM_BASIC_USER` +
+  `LOKI_PROM_BASIC_PASSWORD` (Grafana Cloud), and `LOKI_PROM_ORG_ID` for multi-tenant Mimir. Grafana Loki
+  uses the same names with `LOKI_LOGS_`. Prefer read-only credentials; `loki doctor` uses them.
 - **Logs.** Set `LOKI_URL` to the customer's Grafana Loki base URL. The name is historical:
   `LOKI_URL` means Grafana Loki. Empty means no log source.
 - **Errors.** For Sentry, create an internal integration with `project:read` and `event:read`, then set
@@ -226,9 +227,9 @@ request bodies at 1 MB and sets HSTS, CSP, nosniff, frame-deny and no-referrer h
 
 - **One instance per customer.** There is no multi-tenancy and no HA. A VPS outage means missed alerts until it is back.
   Alertmanager retries, but most SaaS webhooks do not.
-- **No auth to Prometheus or Grafana Loki.** Network-level access control is required (see section 5).
 - Datadog and PagerDuty are intake only. No Datadog metrics or logs are read.
-- Investigations run in-process. A restart marks running ones as failed.
+- Investigations run in-process. After a restart, live ones started in the last 30 minutes are run again
+  from scratch (once); older ones are marked failed.
 - Backups are plain `pg_dump` (no point-in-time recovery), so up to 24 hours of reports can be lost.
 - `install.sh` and `cloud-init.yaml` target Ubuntu. They were exercised on macOS with `--no-docker` and a
   local compose project, **not yet on a real Ubuntu VPS**.
