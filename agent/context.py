@@ -6,14 +6,24 @@ the likely suspects, so the model starts from a strong lead instead of a blank
 page. All of it is free: no model calls happen here.
 """
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+import changepoint
 import telemetry as tm
+
+log = logging.getLogger("agent")
 
 LOOKBACK = timedelta(minutes=15)
 # A deploy this long before the first error is still a suspect.
 DEPLOY_SUSPECT_WINDOW = timedelta(minutes=30)
+# Metric series resolution for change-point detection: the "when" is only this exact.
+CHANGE_STEP_S = 15
+# A service that stayed healthy this long after a deploy is a weaker deploy suspect.
+STEADY_AFTER_DEPLOY_S = 120
+# Changes this soon after a series begins are a service starting up, not an incident.
+WARMUP_S = 120
 
 
 @dataclass
@@ -110,6 +120,86 @@ def rank_suspects(onset: dict[str, datetime], clusters: list[dict], deploys: lis
     return sorted(suspects, key=lambda s: (-s["score"], s["gap"]))
 
 
+def _ago(seconds: float) -> str:
+    seconds = abs(seconds)
+    return f"{seconds:.0f}s" if seconds < 120 else f"{seconds / 60:.0f} min"
+
+
+def metric_changes(services: list[str], metrics: list[str], start: datetime, end: datetime) -> list[dict]:
+    """The earliest step change in each service's metrics and each of its dependencies'
+    latency, oldest first. Only the services in trouble are queried."""
+    def detect(kind, points):
+        change = changepoint.detect_metric(kind, points)
+        # A series that starts well after the window does belongs to something that just
+        # started (a deploy, a restart, a new stack): its first minutes are warm-up, not a change.
+        if change and points and points[0][0] > start + timedelta(seconds=4 * CHANGE_STEP_S) \
+                and change["at"] - points[0][0] < timedelta(seconds=WARMUP_S):
+            return None
+        return change
+
+    changes = []
+    for svc in services:
+        for metric in metrics:
+            change = detect(metric, tm.metric_series(metric, svc, start, end, step_s=CHANGE_STEP_S))
+            if change:
+                changes.append({"service": svc, "what": f"{svc} {metric}", "unit": "", **change})
+    with_deps = set(tm.services_with_dependencies()) if not tm.dependency_unavailable() else set()
+    for svc in services:
+        if svc not in with_deps:
+            continue
+        for dep, points in tm.dependency_p95_series(svc, start, end, step_s=CHANGE_STEP_S).items():
+            change = detect("dependency_p95", points)
+            if change:
+                changes.append({"service": svc, "dependency": dep, "what": f"{svc} -> {dep} p95", "unit": "s", **change})
+    return sorted(changes, key=lambda c: c["at"])
+
+
+def _change_lines(changes: list[dict], deploys: list[dict], onset: dict[str, datetime]) -> list[str]:
+    lines = []
+    for n, c in enumerate(changes):
+        parts = [f"- {tm._hms(c['at'])} {c['what']} {changepoint.describe(c, c['unit'])}"]
+        if n == 0:
+            parts[0] += " (earliest change)"
+        # The most recent deploy before the change, preferring the same service.
+        before = [d for d in deploys if d["deployed_at_dt"] <= c["at"] + timedelta(seconds=CHANGE_STEP_S)
+                  and c["at"] - d["deployed_at_dt"] <= DEPLOY_SUSPECT_WINDOW]
+        same = [d for d in before if d["service"] == c["service"]]
+        d = (same or before or [None])[-1]
+        if d:
+            parts.append(f"{_ago((c['at'] - d['deployed_at_dt']).total_seconds())} after deploy {d['id']} to {d['service']}")
+        first_error = onset.get(c["service"])
+        if first_error:
+            gap = (first_error - c["at"]).total_seconds()
+            rel = "same time" if abs(gap) < CHANGE_STEP_S else f"{_ago(gap)} {'later' if gap > 0 else 'earlier'}"
+            parts.append(f"first error in {c['service']} at {tm._hms(first_error)} ({rel})")
+        lines.append("; ".join(parts))
+    return lines
+
+
+def _deploy_timing_reasons(suspects: list[dict], deploys: list[dict], changes: list[dict]) -> None:
+    """Add what the metrics say about each suspect deploy's timing. Facts only: the
+    score is left alone, so a coincidental deploy can't gain weight from timing."""
+    by_id = {d["id"]: d for d in deploys}
+    for s in suspects:
+        d = by_id.get(s.get("deploy_id"))
+        if s["kind"] != "deploy" or not d:
+            continue
+        own = [c for c in changes if c["service"] == d["service"] and not c.get("dependency")
+               and c["at"] >= d["deployed_at_dt"] - timedelta(seconds=CHANGE_STEP_S)]
+        if not own:
+            continue
+        gap = (own[0]["at"] - d["deployed_at_dt"]).total_seconds()
+        if gap > STEADY_AFTER_DEPLOY_S:
+            s["reasons"].append(f"but {d['service']}'s metrics stayed steady for {_ago(gap)} after it shipped "
+                                "(a code bug usually shows soon after a rollout, unless the code path is rare)")
+        else:
+            s["reasons"].append(f"{own[0]['what']} changed {_ago(max(gap, 0))} after it shipped")
+        deps_first = [c for c in changes if c["service"] == d["service"] and c.get("dependency")
+                      and c["at"] <= own[0]["at"]]
+        if deps_first:
+            s["reasons"].append(f"but {deps_first[0]['what']} changed first, at {tm._hms(deps_first[0]['at'])}")
+
+
 def _fingerprint(first_service: str | None, clusters: list[dict], suspects: list[dict], incidents: list[dict]) -> tuple[str, str]:
     patterns = [tm.normalize(c["example"]) for c in clusters if first_service in c["services"]][:3]
     if not patterns:  # slowness-only incidents: fall back to which alerts fired
@@ -199,7 +289,23 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
         note = "" if d["id"] in running else " (superseded by a later deploy to this service)"
         out.append(f"- {d['id']} {d['service']} {d['version']} at {tm._hms(d['deployed_at_dt'])} by {d['author']}: {d['message']}{note}")
 
+    # When did things change? Step changes in the troubled services' metrics, lined up
+    # with deploys and the first errors. Optional: a failure here never breaks the briefing.
+    changes = []
+    if tm.prom_enabled():
+        troubled = {i["service"] for i in incidents} | set(onset) | {sp["service"] for sp in dep_spikes}
+        try:
+            known = set(tm.services()) if metrics else set()
+            changes = metric_changes(sorted(troubled & known), metrics, start, end)
+        except Exception:  # noqa: BLE001
+            log.exception("change-point detection failed; briefing continues without it")
+    if changes:
+        out += ["", f"## When metrics changed (step changes found in the series, {CHANGE_STEP_S}s resolution; "
+                "rate-based metrics trail the logs by up to ~30s, so the first error time is the sharper clock)",
+                *_change_lines(changes, deploys, onset)]
+
     suspects = rank_suspects(onset, clusters, deploys, incidents, dep_spikes, floor)
+    _deploy_timing_reasons(suspects, deploys, changes)
     out += ["", "## Suspects ranked by simple rules (a starting point: verify, don't trust blindly)"]
     for n, s in enumerate(suspects, 1):
         name = (f"deploy {s['deploy_id']} to {s['service']}" if s["kind"] == "deploy"

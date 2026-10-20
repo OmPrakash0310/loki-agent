@@ -73,7 +73,12 @@ Loki has to find a different kind of cause.
    matches "connection refused to db" with "Postgres pool exhausted". The `search_past_incidents`
    tool searches the same way and falls back to keywords if the model is unavailable.
 3. **Rule-based suspects:** plain code ranks the likely cause before the model starts,
-   so the model verifies instead of searching.
+   so the model verifies instead of searching. Change-point detection (`changepoint.py`, plain
+   statistics) adds *when* things changed: the moment each troubled service's error rate, latency
+   or traffic stepped (15s resolution), its dependencies' latency, and how that lines up with
+   deploys and first errors ("error_rate jumped at 16:21:00, 45s after deploy b2e4a91"; "postgres
+   p95 changed first"; "metrics stayed steady for 4 min after the deploy"). These are facts for
+   the model; they never change suspect scores, so a coincidental deploy gains no weight.
 4. **Tool-result cache:** identical log/metric queries within 45 seconds aren't repeated.
 5. **Cheap model by default** (Claude Haiku 4.5), optional escalation to a stronger one.
 6. **Hard limits:** cost per investigation, cost per day, and a step limit.
