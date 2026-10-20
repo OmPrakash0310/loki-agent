@@ -447,6 +447,18 @@ def error_lines(service: str | None, start: datetime, end: datetime):
     return _not_future(sources.errors().error_lines(service, start, end))
 
 
+def log_lines(service: str | None, start: datetime, end: datetime):
+    """Full logs (not only errors): from the errors source when it can search them (Datadog),
+    otherwise from Grafana Loki."""
+    end = _cap(end)
+    if start >= end:
+        return []
+    lines = sources.errors().all_lines(service, start, end)
+    if lines is None:
+        return fetch_logs(service, start, end, False)
+    return _not_future(lines)
+
+
 def logs_present(start: datetime, end: datetime) -> bool:
     return sources.errors().logs_present(start, end)
 

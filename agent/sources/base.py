@@ -29,6 +29,11 @@ class ErrorsSource:
     def error_lines(self, service: str | None, start: datetime, end: datetime) -> list[tuple]:
         raise NotImplementedError
 
+    def all_lines(self, service: str | None, start: datetime, end: datetime) -> list[tuple] | None:
+        """Every log line (not only errors), same shape as error_lines. None = this source can't
+        search full logs, so the caller falls back to Grafana Loki."""
+        return None
+
     def logs_present(self, start: datetime, end: datetime) -> bool:
         """False only when the pipeline looks broken (no data at all), not when there are no errors."""
         return True

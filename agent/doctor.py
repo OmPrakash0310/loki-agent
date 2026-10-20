@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -160,6 +161,35 @@ def check_sentry(client) -> list[Result]:
     return out
 
 
+def check_datadog(client) -> list[Result]:
+    wanted = _env("LOKI_ERRORS_SOURCE") == "datadog"
+    if not (_env("DATADOG_TOKEN") or _env("DATADOG_API_KEY") or _env("DATADOG_APP_KEY")):
+        if wanted:
+            return [Result(FAIL, "datadog", "LOKI_ERRORS_SOURCE=datadog but no Datadog keys are set")]
+        return [Result(WARN, "datadog", "not configured (alerts can still arrive; Loki can't read Datadog logs)")]
+    from sources import datadog
+    try:
+        headers, base = datadog.auth_headers(), datadog._base_url()
+    except ValueError as e:
+        return [Result(FAIL, "datadog", str(e))]
+    now = datetime.now(timezone.utc)
+    body = {"filter": {"query": "*", "from": datadog._iso(now - timedelta(minutes=15)), "to": datadog._iso(now)},
+            "page": {"limit": 1}}
+    try:
+        r = client.post(f"{base}/api/v2/logs/events/search", headers=headers, json=body)
+    except httpx.HTTPError as e:
+        return [Result(FAIL, "datadog", f"unreachable: {type(e).__name__}")]
+    if r.status_code in (401, 403):
+        return [Result(FAIL, "datadog", f"unauthorized (HTTP {r.status_code}): check the keys, the site "
+                                         f"({_env('DATADOG_SITE') or 'datadoghq.com'}) and logs_read_data")]
+    if r.status_code >= 400:
+        return [Result(FAIL, "datadog", f"HTTP {r.status_code}")]
+    out = [Result(OK, "datadog logs", f"readable ({base})")]
+    if not wanted:
+        out.append(Result(WARN, "datadog source", "keys work but LOKI_ERRORS_SOURCE is not 'datadog': Loki isn't reading them"))
+    return out
+
+
 def check_slack(client) -> list[Result]:
     out = []
     token, channel = _env("SLACK_BOT_TOKEN"), _env("SLACK_CHANNEL")
@@ -219,7 +249,7 @@ def run(offline: bool = False, client=None, connect=None) -> list[Result]:
     client = client or httpx.Client(timeout=10)
     try:
         results += [check_prometheus(client), check_grafana_loki(client)]
-        results += check_github(client) + check_sentry(client) + check_slack(client)
+        results += check_github(client) + check_sentry(client) + check_datadog(client) + check_slack(client)
         results.append(check_model(client, False))
     finally:
         if own:
