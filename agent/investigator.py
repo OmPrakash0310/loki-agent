@@ -80,6 +80,10 @@ a tool result, and quote specific numbers and log lines. Set confidence honestly
 evidence is thin or two causes fit equally well. Most incidents need 2 to 5 tool calls."""
 
 
+# Briefing hint from a past incident matched by meaning: only when it is clearly close.
+HINT_MIN_SCORE = float(os.environ.get("LOKI_HINT_MIN_SIMILARITY", "0.75"))
+
+
 class BudgetExceeded(Exception):
     pass
 
@@ -329,6 +333,25 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
                 "Check whether the same cause applies now; don't assume it."
             )
             cache_hit = f"hint:{similar['investigation_id']}"
+        elif not backtest:
+            # No exact fingerprint match: look for a confirmed incident that *means* the same
+            # thing (embeddings). A stricter bar than the search tool, since nobody asked for it.
+            try:
+                close = tools.similar_incidents(conn, briefing.search_text, limit=1, min_score=HINT_MIN_SCORE)
+            except Exception:  # noqa: BLE001 - a hint is optional; never fail the investigation over it
+                log.exception("investigation #%s: similar-incident lookup failed", inv_id)
+                close = None
+            if close:
+                score, row = close[0]
+                r = row["report"]
+                briefing.text += (
+                    f"\n\n## Possibly similar past incident #{row['id']} (confirmed by a human; "
+                    f"similarity {score:.2f}, matched by meaning)\n"
+                    f"- What it was: {r.get('summary', '')}\n- Root cause then: {r.get('root_cause', '')}\n"
+                    f"- Action then: {r.get('suggested_action', '')}: {r.get('action_detail', '')}\n"
+                    "It may be a different problem that looks alike. Check the evidence now; don't assume it."
+                )
+                cache_hit = f"hint:{row['id']}"
         # Lessons learned from verified mistakes (human rejects, eval misses, manual).
         # A backtest only sees lessons that existed at its replay time.
         if lessons.enabled():

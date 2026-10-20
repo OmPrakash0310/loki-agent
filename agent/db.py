@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS report_cache (
     hits INT NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS report_cache_fingerprint ON report_cache (fingerprint);
+-- Meaning of a confirmed answer as a vector (embeddings.py), filled in lazily on first search.
+ALTER TABLE report_cache ADD COLUMN IF NOT EXISTS embedding REAL[];
+ALTER TABLE report_cache ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 
 -- Every tool call Loki makes, for debugging and audit.
 CREATE TABLE IF NOT EXISTS trace_steps (

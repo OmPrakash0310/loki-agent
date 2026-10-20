@@ -82,6 +82,7 @@ services:
       SLACK_CHANNEL: ${SLACK_CHANNEL:-}
       # Live probes (off by default): LOKI_PROBES=1 plus the shared token offers capture_variables.
       LOKI_PROBES: ${LOKI_PROBES:-0}
+      LOKI_EMBEDDINGS: ${LOKI_EMBEDDINGS:-local}   # similar-incident search by meaning; off = keywords
       LOKI_PROBE_ENDPOINTS: ${LOKI_PROBE_ENDPOINTS:-payments-svc=http://payments-svc:8000}
       LOKI_PROBE_TOKEN: ${LOKI_PROBE_TOKEN:-}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import httpx
 
 import db
+import embeddings
 import telemetry as tm
 from redact import redact
 
@@ -85,10 +86,11 @@ TOOLS = [
     },
     {
         "name": "search_past_incidents",
-        "description": "Search earlier incidents whose root cause a human confirmed, and how they were resolved.",
+        "description": "Search earlier incidents whose root cause a human confirmed, and how they were resolved. "
+                       "Matches by meaning when available: describe the symptom or error in plain words.",
         "input_schema": {
             "type": "object",
-            "properties": {"query": {"type": "string", "description": "Keywords, e.g. a service or error name."}},
+            "properties": {"query": {"type": "string", "description": "The symptom, error or service, e.g. 'payments 500s, database connection timeouts'."}},
             "required": ["query"],
         },
     },
@@ -180,29 +182,77 @@ def git_diff(deploy_id):
     return tm.deploy_diff(deploy_id)
 
 
+# Search by meaning: at most this many confirmed incidents are compared (newest first),
+# and a match must be at least this similar. bge-small scores related text around
+# 0.65-0.8 and unrelated text around 0.5-0.6.
+SEMANTIC_CANDIDATES = 500
+SEMANTIC_BACKFILL = 100  # incidents embedded per call when they have no vector yet
+SEMANTIC_MIN_SCORE = 0.62
+
+
+def _confirmed_incidents(conn, extra_sql: str = "", params: list | None = None, limit: int = 5):
+    # Only answers a human confirmed. Unconfirmed reports may be wrong, and feeding
+    # them back in makes Loki repeat its own mistakes.
+    return conn.execute(
+        "SELECT i.id, i.finished_at, i.report, c.exact_key, c.embedding, c.embedding_model "
+        "FROM investigations i JOIN report_cache c ON c.investigation_id = i.id AND c.confirmed "
+        # Live incidents only, and only ones already solved by "now": in a backtest,
+        # an answer found after the replay time would be knowledge from the future.
+        "WHERE i.mode = 'live' AND i.finished_at <= %s AND c.created_at <= %s "
+        + extra_sql + " ORDER BY i.id DESC LIMIT %s",
+        [tm.now(), tm.now(), *(params or []), limit],
+    ).fetchall()
+
+
+def similar_incidents(conn, text: str, limit: int = 5, min_score: float = SEMANTIC_MIN_SCORE):
+    """Confirmed past incidents whose meaning is closest to `text`, best first, as
+    (score, row). None when embeddings are off or unavailable (callers fall back)."""
+    if not embeddings.enabled():
+        return None
+    rows = _confirmed_incidents(conn, limit=SEMANTIC_CANDIDATES)
+    model = embeddings.model_name()
+    stale = [r for r in rows if not r["embedding"] or r["embedding_model"] != model][:SEMANTIC_BACKFILL]
+    if stale:
+        vectors = embeddings.embed_documents([embeddings.incident_text(r["report"]) for r in stale])
+        if vectors is None:
+            return None
+        for r, v in zip(stale, vectors):
+            conn.execute("UPDATE report_cache SET embedding = %s, embedding_model = %s WHERE exact_key = %s",
+                         (v, model, r["exact_key"]))
+            r["embedding"], r["embedding_model"] = v, model
+    q = embeddings.embed_query(text)
+    if q is None:
+        return None
+    scored = [(embeddings.similarity(q, r["embedding"]), r) for r in rows
+              if r["embedding"] and r["embedding_model"] == model]
+    scored = [(s, r) for s, r in scored if s >= min_score]
+    scored.sort(key=lambda x: -x[0])
+    return scored[:limit]
+
+
+def _past(r, score=None):
+    out = {
+        "investigation": r["id"],
+        "date": r["finished_at"].isoformat() if r["finished_at"] else None,
+        "summary": r["report"].get("summary"),
+        "action": r["report"].get("suggested_action"),
+    }
+    if score is not None:
+        out["similarity"] = round(score, 2)
+    return out
+
+
 def search_past_incidents(query):
-    words = [w for w in query.split() if len(w) > 2][:5] or [query]
     with db.connect() as conn:
-        rows = conn.execute(
-            # Only answers a human confirmed. Unconfirmed reports may be wrong, and feeding
-            # them back in makes Loki repeat its own mistakes.
-            "SELECT i.id, i.finished_at, i.report FROM investigations i "
-            "JOIN report_cache c ON c.investigation_id = i.id AND c.confirmed "
-            # Live incidents only, and only ones already solved by "now": in a backtest,
-            # an answer found after the replay time would be knowledge from the future.
-            "WHERE i.mode = 'live' AND i.finished_at <= %s AND c.created_at <= %s "
-            "AND (" + " OR ".join(["i.report::text ILIKE %s"] * len(words)) + ") ORDER BY i.id DESC LIMIT 5",
-            [tm.now(), tm.now(), *[f"%{w}%" for w in words]],
-        ).fetchall()
-    return [
-        {
-            "investigation": r["id"],
-            "date": r["finished_at"].isoformat() if r["finished_at"] else None,
-            "summary": r["report"].get("summary"),
-            "action": r["report"].get("suggested_action"),
-        }
-        for r in rows
-    ]
+        matches = similar_incidents(conn, query)
+        if matches is not None:
+            return [_past(r, s) for s, r in matches]
+        # Keyword fallback: embeddings off or unavailable.
+        words = [w for w in query.split() if len(w) > 2][:5] or [query]
+        rows = _confirmed_incidents(
+            conn, "AND (" + " OR ".join(["i.report::text ILIKE %s"] * len(words)) + ")",
+            [f"%{w}%" for w in words])
+    return [_past(r) for r in rows]
 
 
 # The investigation's time window. Tools never look earlier than this, so

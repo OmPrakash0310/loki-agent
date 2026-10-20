@@ -23,6 +23,7 @@ class Briefing:
     exact_key: str  # fingerprint + the suspect deploy: the key for reusing a confirmed answer
     suspects: list[dict] = field(default_factory=list)
     onset: dict[str, datetime] = field(default_factory=dict)
+    search_text: str = ""  # alerts + top error patterns: what to look up among past incidents
 
 
 def _error_onset(lines) -> dict[str, datetime]:
@@ -208,4 +209,7 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
 
     out += ["", f"Current time: {tm._hms(end)} UTC."]
     fingerprint, exact_key = _fingerprint(source_service(onset, clusters)[0], clusters, suspects, incidents)
-    return Briefing("\n".join(out), fingerprint, exact_key, suspects, onset)
+    search_text = "\n".join(
+        [f"{i['alert_name']} on {i['service']}: {i['summary']}" for i in incidents]
+        + [c["example"] for c in clusters[:5]])[:2000]
+    return Briefing("\n".join(out), fingerprint, exact_key, suspects, onset, search_text)

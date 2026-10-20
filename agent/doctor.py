@@ -190,6 +190,20 @@ def check_datadog(client) -> list[Result]:
     return out
 
 
+def check_embeddings() -> Result:
+    mode = (_env("LOKI_EMBEDDINGS") or "off").lower()
+    if mode != "local":
+        return Result(WARN, "similar incidents", "LOKI_EMBEDDINGS is off: past incidents are matched by keywords only")
+    try:
+        import fastembed  # noqa: F401
+    except ImportError:
+        return Result(FAIL, "similar incidents", "LOKI_EMBEDDINGS=local but fastembed is not installed in this image")
+    cache = _env("LOKI_EMBEDDING_CACHE")
+    if cache and not os.path.isdir(cache):
+        return Result(FAIL, "similar incidents", f"model folder {cache} is missing")
+    return Result(OK, "similar incidents", "local embedding model (matched by meaning)")
+
+
 def check_slack(client) -> list[Result]:
     out = []
     token, channel = _env("SLACK_BOT_TOKEN"), _env("SLACK_CHANNEL")
@@ -242,7 +256,7 @@ def webhook_urls(show_token: bool) -> list[str]:
 
 
 def run(offline: bool = False, client=None, connect=None) -> list[Result]:
-    results = check_required() + check_auth() + [check_database(connect)]
+    results = check_required() + check_auth() + [check_database(connect), check_embeddings()]
     if offline:
         return results + [check_model(None, True)]
     own = client is None
