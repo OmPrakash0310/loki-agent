@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+import changepoint
 import db
 import embeddings
 import telemetry as tm
@@ -157,7 +158,7 @@ def query_metrics(metric, service, minutes=20):
     if not points:
         return {"service": service, "metric": metric, "points": [], "note": "no data (unknown service or no traffic)"}
     values = [v for _, v in points]
-    return {
+    out = {
         "service": service,
         "metric": metric,
         "first": values[0],
@@ -166,6 +167,10 @@ def query_metrics(metric, service, minutes=20):
         "max": max(values),
         "points": [[tm._hms(t), v] for t, v in points],
     }
+    change = changepoint.detect_metric(metric, points)
+    if change:
+        out["change"] = f"{tm._hms(change['at'])}: {changepoint.describe(change)}"
+    return out
 
 
 def recent_deploys(minutes=120):
