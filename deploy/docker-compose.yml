@@ -35,6 +35,7 @@ services:
       LOKI_REQUIRE_AUTH: "1"                  # never start open, whatever loki.env says
       LOKI_VERIFY: ${LOKI_VERIFY:-0}          # needs a Docker socket; off for pilots
       LOKI_PROBES: ${LOKI_PROBES:-0}
+      LOKI_EMBEDDINGS: ${LOKI_EMBEDDINGS:-local}   # similar-incident search by meaning; off = keywords
       LOKI_PROM_URL: ${LOKI_PROM_URL:-}       # the CUSTOMER's Prometheus; empty = none
       LOKI_URL: ${LOKI_URL:-}                 # the CUSTOMER's Grafana Loki (logs)
       DEPLOYS_FILE: /nonexistent/deploys.json # pilots use LOKI_DEPLOYS_SOURCE=github

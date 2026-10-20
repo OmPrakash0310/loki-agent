@@ -67,7 +67,11 @@ Loki has to find a different kind of cause.
 1. **Answer cache:** once a human confirms a report (`POST /investigations/<id>/confirm`),
    the exact same incident (same error fingerprint and same suspect deploy) is answered
    from cache for $0 with no model calls. A new deploy never reuses an old answer.
-2. **Hint cache:** a similar earlier incident is added to the briefing as a lead.
+2. **Hint cache:** a similar earlier incident is added to the briefing as a lead. "Similar" means the
+   same fingerprint, or, with `LOKI_EMBEDDINGS=local` (on in the compose files), the same *meaning*:
+   a small local embedding model (`bge-small`, baked into the image, nothing leaves the server)
+   matches "connection refused to db" with "Postgres pool exhausted". The `search_past_incidents`
+   tool searches the same way and falls back to keywords if the model is unavailable.
 3. **Rule-based suspects:** plain code ranks the likely cause before the model starts,
    so the model verifies instead of searching.
 4. **Tool-result cache:** identical log/metric queries within 45 seconds aren't repeated.

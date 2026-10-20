@@ -8,13 +8,19 @@ RUN python -m venv /opt/venv
 COPY requirements.txt /tmp/requirements.txt
 RUN /opt/venv/bin/pip install -r /tmp/requirements.txt \
  && (/opt/venv/bin/pip uninstall -y pip setuptools wheel || true)
+# Bake the embedding model in, so a running Loki never downloads anything (embeddings.py).
+ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+RUN /opt/venv/bin/python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='${EMBEDDING_MODEL}', cache_dir='/opt/models')" \
+ && chmod -R a+rX /opt/models
 
 # ---- runtime stage: no compilers, no pip cache, non-root ----
 FROM ${PYTHON_IMAGE}
-ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    LOKI_EMBEDDING_CACHE=/opt/models HF_HUB_OFFLINE=1 ORT_DISABLE_TELEMETRY=1
 RUN groupadd --system --gid 10001 loki \
  && useradd --system --uid 10001 --gid loki --home-dir /app --shell /usr/sbin/nologin loki
 COPY --from=build /opt/venv /opt/venv
+COPY --from=build /opt/models /opt/models
 WORKDIR /app
 COPY --chown=root:root . .
 USER 10001:10001

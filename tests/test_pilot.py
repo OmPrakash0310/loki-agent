@@ -32,10 +32,12 @@ GOOD = {
     "SLACK_CHANNEL": "C123",
     "SLACK_SIGNING_SECRET": "s",
     "LOKI_OPERATOR_SLACK_WEBHOOK": "https://hooks.slack.com/services/T/B/x",
+    "LOKI_EMBEDDINGS": "local",
 }
 ENV_NAMES = set(GOOD) | {"PROM_URL", "LOKI_VERIFY", "LOKI_PROBES", "SLACK_WEBHOOK_URL", "LOKI_OLLAMA_URL",
                          "GITHUB_API_URL", "SENTRY_BASE_URL",
-                         "DATADOG_API_KEY", "DATADOG_APP_KEY", "DATADOG_TOKEN", "DATADOG_SITE", "DATADOG_BASE_URL"}
+                         "DATADOG_API_KEY", "DATADOG_APP_KEY", "DATADOG_TOKEN", "DATADOG_SITE", "DATADOG_BASE_URL",
+                         "LOKI_EMBEDDING_CACHE"}
 
 
 @pytest.fixture

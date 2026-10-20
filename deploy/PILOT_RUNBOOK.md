@@ -132,6 +132,11 @@ All of these live in `loki.env`. Run `loki restart && loki doctor` after each ch
 - **Model.** Set `ANTHROPIC_API_KEY` and keep `LOKI_MODEL=claude-haiku-4-5` to start. Doctor checks the
   key with the free models list.
 
+- **Similar past incidents.** `LOKI_EMBEDDINGS=local` (the default in `docker-compose.yml` and the template)
+  finds confirmed past incidents by meaning with a local model baked into the image: no extra service, no
+  data leaves the VPS, about 190 MB of memory once loaded. Installs from before 0.1.2 have a compose file
+  without this line: add `LOKI_EMBEDDINGS=local` to `loki.env`. `off` falls back to keyword search.
+
 ## 6. Slack, in shadow mode for the first 2 weeks
 
 1. api.slack.com/apps → *Create New App* → *From a manifest* → paste `deploy/slack-app-manifest.yml`
