@@ -4,3 +4,7 @@ __pycache__/
 evals/results/
 .venv/
 .pytest_cache/
+
+# OTel Demo lab: generated per run
+otel-demo/state/
+otel-demo/runs.jsonl

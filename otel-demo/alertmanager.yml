@@ -1,0 +1,12 @@
+route:
+  receiver: loki
+  group_by: [alertname, service_name]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: loki
+    webhook_configs:
+      - url: http://loki-agent:8080/alerts
+        send_resolved: true

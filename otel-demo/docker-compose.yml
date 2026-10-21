@@ -1,0 +1,61 @@
+# Loki's side of the OTel Demo lab (see otel-demo/README.md).
+# The OpenTelemetry Demo runs as its own compose project; this one joins its network
+# and watches it. Names are prefixed so they never clash with the demo's own
+# "prometheus", "grafana" and so on.
+
+services:
+  loki-db:
+    image: postgres:16
+    environment: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: agent }
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "app", "-d", "agent"]
+      interval: 2s
+      retries: 20
+
+  # Log store. The demo's collector sends every service's logs here over OTLP;
+  # service.name becomes the "service_name" stream label.
+  grafana-loki:
+    image: grafana/loki:3.0.0
+    ports: ["3100:3100"]
+
+  # Copies the demo Prometheus's series (federation) and runs our alert rules on them.
+  loki-prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9091:9090"]
+
+  loki-alertmanager:
+    image: prom/alertmanager:v0.27.0
+    volumes: [./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro]
+    ports: ["9093:9093"]
+
+  loki-agent:
+    build: ../agent
+    environment:
+      DATABASE_URL: postgresql://app:app@loki-db:5432/agent
+      LOKI_URL: http://grafana-loki:3100
+      LOKI_PROM_URL: http://loki-prometheus:9090
+      DEPLOYS_FILE: /state/deploys.json
+      LOKI_METRICS_CONFIG: /lab/metrics.json
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LOKI_MODEL: ${LOKI_MODEL:-claude-haiku-4-5}
+      LOKI_MAX_STEPS: ${LOKI_MAX_STEPS:-8}
+      LOKI_MAX_COST_USD: ${LOKI_MAX_COST_USD:-0.10}
+      LOKI_DAILY_BUDGET_USD: ${LOKI_DAILY_BUDGET_USD:-1.00}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      LOKI_EMBEDDINGS: ${LOKI_EMBEDDINGS:-local}
+    volumes:
+      - ./state:/state:ro          # deploy history; break.py writes it
+      - ./metrics.json:/lab/metrics.json:ro
+    ports: ["8088:8080"]
+    depends_on:
+      loki-db: { condition: service_healthy }
+      grafana-loki: { condition: service_started }
+      loki-prometheus: { condition: service_started }
+
+networks:
+  default:
+    name: opentelemetry-demo   # the demo's network
+    external: true

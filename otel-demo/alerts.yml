@@ -1,0 +1,22 @@
+# Same alerts as observability/alerts.yml, on the demo's span metrics.
+# Server spans only, so a call isn't counted twice (once by the caller, once by the callee).
+groups:
+  - name: otel-demo
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER",status_code="STATUS_CODE_ERROR"}[1m]))
+            / sum by (service_name) (rate(traces_span_metrics_calls_total{span_kind="SPAN_KIND_SERVER"}[1m])) > 0.05
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.service_name }} error rate is {{ $value | humanizePercentage }}"
+      - alert: HighLatency
+        # Span durations are in milliseconds.
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER"}[1m]))) > 1000
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service_name }} p95 latency is {{ $value | humanize }}ms"

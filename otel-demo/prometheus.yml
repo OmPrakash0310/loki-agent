@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files: [/etc/prometheus/alerts.yml]
+
+alerting:
+  alertmanagers:
+    - static_configs: [{ targets: ["loki-alertmanager:9093"] }]
+
+scrape_configs:
+  # Pull the demo Prometheus's series as-is. The demo's collector writes its span
+  # metrics (calls and duration per service) there.
+  - job_name: otel-demo
+    honor_labels: true
+    metrics_path: /federate
+    params:
+      "match[]": ['{__name__=~"traces_span_metrics_.+"}']
+    static_configs:
+      - targets: ["prometheus:9090"]
