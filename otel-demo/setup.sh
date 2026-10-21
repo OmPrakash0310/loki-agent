@@ -2,7 +2,7 @@
 # One-command setup for the OTel Demo lab on a fresh Ubuntu server.
 #   ./otel-demo/setup.sh            full demo (needs 16 GB RAM)
 #   ./otel-demo/setup.sh --minimal  smaller demo (8 GB RAM)
-# Run it from the incident-agent folder, with ANTHROPIC_API_KEY in .env.
+# Run it from the repo folder, with ANTHROPIC_API_KEY in .env.
 set -euo pipefail
 
 DEMO_VERSION=2.0.2
@@ -27,6 +27,9 @@ step "3/6 Downloading the OpenTelemetry Demo $DEMO_VERSION"
 [[ -d "$DEMO_DIR" ]] || git clone --depth 1 --branch "$DEMO_VERSION" \
   https://github.com/open-telemetry/opentelemetry-demo.git "$DEMO_DIR"
 
+# The demo's .env says DEMO_VERSION=latest: newer images that don't match these config files.
+sed -i "s/^DEMO_VERSION=.*/DEMO_VERSION=$DEMO_VERSION/" "$DEMO_DIR/.env"
+
 step "4/6 Sending the demo's logs to Grafana Loki too"
 # Keep the demo's own log exporters and add ours. The extras file is merged over the main config.
 python3 - "$DEMO_DIR/src/otel-collector" <<'PY'
@@ -37,6 +40,8 @@ exporters = list(base["service"]["pipelines"]["logs"]["exporters"])
 if "otlphttp/grafana-loki" not in exporters:
     exporters.append("otlphttp/grafana-loki")
 extras = {
+    # The demo's collector asks Docker for API 1.25; Docker 29+ only accepts 1.40 and up.
+    "receivers": {"docker_stats": {"api_version": "1.44"}},
     "exporters": {"otlphttp/grafana-loki": {"endpoint": "http://grafana-loki:3100/otlp"}},
     "service": {"pipelines": {"logs": {"exporters": exporters}}},
 }

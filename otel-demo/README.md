@@ -17,7 +17,7 @@ OTel Demo ──span metrics──► demo Prometheus ──► loki-prometheus 
 2. **Log in and get the code.**
    ```bash
    ssh root@<droplet-ip>
-   git clone https://github.com/OmPrakash0310/incident-agent.git && cd incident-agent
+   git clone https://github.com/OmPrakash0310/loki-agent.git && cd loki-agent
    echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
    ```
 3. **Run setup** (about 10 minutes the first time):

@@ -7,5 +7,6 @@
   "latency_histogram": "traces_span_metrics_duration_milliseconds",
   "dependency_histogram": null,
   "log_service_label": "service_name",
-  "services_from_requests": true
+  "services_from_requests": true,
+  "rate_window": "5m"
 }

@@ -29,16 +29,17 @@ DEPLOYS_FILE = HERE / "state" / "deploys.json"
 RUNS_FILE = HERE / "runs.jsonl"
 LOKI_URL = os.environ.get("LOKI_AGENT_URL", "http://localhost:8088")
 
-# flag -> (service at fault, what the "bad deploy" changed, short diff)
+# flag -> (service at fault, what the "bad deploy" changed, short diff).
+# Diffs carry no comments that name the problem: Loki has to find it in the evidence.
 FAILURES = {
     "paymentFailure": ("payment", "Retry card charges with new gateway client",
-                       "-  const result = await gateway.charge(card, amount)\n+  const result = await newGateway.charge(card, amount)  // no fallback"),
+                       "-  const result = await gateway.charge(card, amount)\n+  const result = await newGateway.charge(card, amount)"),
     "paymentUnreachable": ("payment", "Move payment service to new port",
                            "-  PAYMENT_PORT: 50051\n+  PAYMENT_PORT: 50052"),
     "adHighCpu": ("ad", "Rank ads with full scoring pass",
-                  "-  return ads.subList(0, 2);\n+  for (Ad a : ads) for (Ad b : ads) score(a, b);  // O(n^2) per request"),
+                  "-  return ads.subList(0, 2);\n+  for (Ad a : ads) for (Ad b : ads) score(a, b);"),
     "adManualGc": ("ad", "Free memory after each ad request",
-                   "+  System.gc();  // after every request"),
+                   "+  System.gc();"),
     "adFailure": ("ad", "Validate ad request context",
                   "+  if (random.nextInt(10) == 0) throw new StatusRuntimeException(Status.UNAVAILABLE);"),
     "cartFailure": ("cart", "Switch cart store connection settings",
@@ -46,11 +47,11 @@ FAILURES = {
     "productCatalogFailure": ("product-catalog", "Add product lookup validation",
                               "+  if id == \"OLJCESPC7Z\" { return nil, status.Errorf(codes.Internal, \"invalid product\") }"),
     "recommendationCacheFailure": ("recommendation", "Cache product list in memory",
-                                   "+  cached_ids.extend(product_ids)  # never cleared"),
+                                   "+  cached_ids.extend(product_ids)"),
     "emailMemoryLeak": ("email", "Keep sent emails for audit",
-                        "+  $sent_emails << email  # grows forever"),
+                        "+  $sent_emails << email"),
     "imageSlowLoad": ("image-provider", "Serve images through new resize path",
-                      "+  sleep(rand(1..5))  # resize on the fly"),
+                      "+  img = resize(img, params)"),
     "kafkaQueueProblems": ("kafka", "Raise order event batch size",
                            "-  batch.size=16384\n+  batch.size=1048576"),
 }
@@ -136,6 +137,8 @@ def cmd_score():
             report = r.read().decode()
     except Exception as e:
         sys.exit(f"Couldn't read Loki's report from {LOKI_URL}: {e}")
+    if "is running" in report and len(report) < 200:
+        sys.exit(f"{report.strip()} Try again in a minute.")
     text = report.lower()
     got_service = truth["service"].lower() in text
     got_deploy = truth["deploy_id"].lower() in text
