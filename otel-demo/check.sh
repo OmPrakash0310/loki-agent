@@ -15,7 +15,7 @@ n=$(curl -fsS 'localhost:9091/api/v1/label/service_name/values' | python3 -c 'im
 echo "Logs (demo -> Grafana Loki on :3100)"
 svc=$(curl -fsS 'localhost:3100/loki/api/v1/label/service_name/values' | python3 -c 'import sys,json; print(", ".join(json.load(sys.stdin).get("data") or []))' 2>/dev/null)
 [[ -n "$svc" ]] && ok "logs from: $svc" \
-  || bad "no logs yet; see: docker logs otel-collector 2>&1 | grep -i grafana-loki"
+  || bad "no logs yet; see: docker compose -f otel-demo/docker-compose.yml logs promtail"
 
 echo "Alerts"
 curl -fsS localhost:9091/api/v1/rules >/dev/null && ok "alert rules loaded" || bad "Prometheus rules not loaded"

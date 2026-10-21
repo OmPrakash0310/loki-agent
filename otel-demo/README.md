@@ -6,7 +6,7 @@ so you can break the store on purpose and check whether Loki finds the real caus
 
 ```
 OTel Demo ──span metrics──► demo Prometheus ──► loki-prometheus (alert rules) ──► loki-alertmanager ─┐
-    └──────────logs (OTLP)──────────────────► grafana-loki                                         ▼
+    └──container output── promtail ─────────► grafana-loki                                         ▼
                                                      └──────────────────────────────────────► loki-agent :8088
 ```
 

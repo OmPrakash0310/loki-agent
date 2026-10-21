@@ -30,23 +30,16 @@ step "3/6 Downloading the OpenTelemetry Demo $DEMO_VERSION"
 # The demo's .env says DEMO_VERSION=latest: newer images that don't match these config files.
 sed -i "s/^DEMO_VERSION=.*/DEMO_VERSION=$DEMO_VERSION/" "$DEMO_DIR/.env"
 
-step "4/6 Sending the demo's logs to Grafana Loki too"
-# Keep the demo's own log exporters and add ours. The extras file is merged over the main config.
+step "4/6 Fixing the demo's collector for new Docker versions"
+# Logs reach Grafana Loki through Promtail (it reads every container's output), not the
+# collector: several demo services only log to stdout. The extras file is merged over the
+# main config; writing it fresh also removes the OTLP log export older versions added.
 python3 - "$DEMO_DIR/src/otel-collector" <<'PY'
 import sys, yaml, pathlib
 d = pathlib.Path(sys.argv[1])
-base = yaml.safe_load((d / "otelcol-config.yml").read_text())
-exporters = list(base["service"]["pipelines"]["logs"]["exporters"])
-if "otlphttp/grafana-loki" not in exporters:
-    exporters.append("otlphttp/grafana-loki")
-extras = {
-    # The demo's collector asks Docker for API 1.25; Docker 29+ only accepts 1.40 and up.
-    "receivers": {"docker_stats": {"api_version": "1.44"}},
-    "exporters": {"otlphttp/grafana-loki": {"endpoint": "http://grafana-loki:3100/otlp"}},
-    "service": {"pipelines": {"logs": {"exporters": exporters}}},
-}
+# The demo's collector asks Docker for API 1.25; Docker 29+ only accepts 1.40 and up.
+extras = {"receivers": {"docker_stats": {"api_version": "1.44"}}}
 (d / "otelcol-config-extras.yml").write_text(yaml.safe_dump(extras, sort_keys=False))
-print("  logs go to:", ", ".join(exporters))
 PY
 
 step "5/6 Starting the demo store ($COMPOSE_FILE)"
