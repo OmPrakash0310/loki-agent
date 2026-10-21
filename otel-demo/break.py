@@ -20,6 +20,7 @@ import os
 import random
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -157,10 +158,18 @@ def cmd_score():
     if not runs:
         sys.exit("Nothing broken yet.")
     truth = runs[-1]
+    started = datetime.fromisoformat(truth["started_at"])
     try:
-        with urllib.request.urlopen(f"{LOKI_URL}/investigations/latest/report", timeout=10) as r:
+        with urllib.request.urlopen(f"{LOKI_URL}/investigations", timeout=10) as r:
+            invs = json.load(r)
+        # The first live investigation opened after this break, not one left from an earlier run.
+        mine = [i for i in invs if i["mode"] == "live" and datetime.fromisoformat(i["created_at"]) >= started]
+        if not mine:
+            sys.exit("Loki hasn't opened an investigation since this break yet. Try again in a minute.")
+        inv_id = min(i["id"] for i in mine)
+        with urllib.request.urlopen(f"{LOKI_URL}/investigations/{inv_id}/report", timeout=10) as r:
             report = r.read().decode()
-    except Exception as e:
+    except urllib.error.URLError as e:
         sys.exit(f"Couldn't read Loki's report from {LOKI_URL}: {e}")
     if "is running" in report and len(report) < 200:
         sys.exit(f"{report.strip()} Try again in a minute.")
