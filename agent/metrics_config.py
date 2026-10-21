@@ -53,6 +53,9 @@ class MetricsConfig:
     # Range for rate() and histogram queries. Widen it ("5m") when series update less than
     # about twice a minute, or rate() over 1m has one sample and returns nothing.
     rate_window: str = "1m"
+    # Multiplies latency histogram values into seconds: 0.001 for histograms in milliseconds
+    # (OpenTelemetry span metrics). Applies to the request and dependency histograms.
+    latency_scale: float = 1.0
 
     def __post_init__(self):
         for name in ("service_label", "dependency_label", "log_service_label"):
@@ -60,6 +63,8 @@ class MetricsConfig:
                 raise ValueError(f"metrics config: {name} {getattr(self, name)!r} is not a valid label name")
         if self.status_label is not None and not _LABEL.match(self.status_label):
             raise ValueError(f"metrics config: status_label {self.status_label!r} is not a valid label name")
+        if not (isinstance(self.latency_scale, (int, float)) and self.latency_scale > 0):
+            raise ValueError(f"metrics config: latency_scale {self.latency_scale!r} must be a positive number")
         if not _WINDOW.match(self.rate_window or ""):
             raise ValueError(f"metrics config: rate_window {self.rate_window!r} is not a duration like 1m or 300s")
         for name in ("requests", "latency_histogram", "dependency_histogram"):
@@ -94,16 +99,19 @@ class MetricsConfig:
             return (f"(sum(rate({self.requests}{err}[{w}])) or vector(0))"
                     f" / sum(rate({self.requests}{self._sel(service)}[{w}]))")
         if metric == "p95_latency_seconds":
-            return ("histogram_quantile(0.95, sum by (le) "
-                    f"(rate({self.latency_histogram}_bucket{self._sel(service)}[{w}])))")
+            return self._scaled("histogram_quantile(0.95, sum by (le) "
+                                f"(rate({self.latency_histogram}_bucket{self._sel(service)}[{w}])))")
         return f"sum(rate({self.requests}{self._sel(service)}[{w}]))"
 
     def dependency_promql(self, service: str) -> str:
         if not self.dependency_histogram:
             raise ValueError("no dependency metric configured")
         w = self.rate_window
-        return (f"histogram_quantile(0.95, sum by (le, {self.dependency_label}) "
-                f"(rate({self.dependency_histogram}_bucket{self._sel(service)}[{w}])))")
+        return self._scaled(f"histogram_quantile(0.95, sum by (le, {self.dependency_label}) "
+                            f"(rate({self.dependency_histogram}_bucket{self._sel(service)}[{w}])))")
+
+    def _scaled(self, query: str) -> str:
+        return query if self.latency_scale == 1 else f"({query}) * {self.latency_scale:g}"
 
     def services_match(self) -> str | None:
         """match[] for listing services, or None for every value of the label."""

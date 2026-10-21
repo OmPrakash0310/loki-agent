@@ -8,5 +8,6 @@
   "dependency_histogram": null,
   "log_service_label": "service_name",
   "services_from_requests": true,
-  "rate_window": "5m"
+  "rate_window": "5m",
+  "latency_scale": 0.001
 }

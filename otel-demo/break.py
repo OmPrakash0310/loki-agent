@@ -6,18 +6,21 @@
     python3 otel-demo/break.py reset              turn everything off
     python3 otel-demo/break.py score              compare Loki's last report with the truth
 
-Turning a failure on does three things:
-  1. flips the demo's feature flag (flagd reads the file and applies it within seconds)
-  2. records a matching "bad deploy" in state/deploys.json, plus an innocent one on
-     another service, so Loki has to pick the right one
-  3. appends the true answer to runs.jsonl, so results can be scored later
+Turning a failure on does four things:
+  1. checks the store has recovered from the last failure (add --force to skip)
+  2. flips the demo's feature flag (flagd reads the file and applies it within seconds)
+  3. starts a fresh deploy history: a few innocent deploys plus one matching "bad
+     deploy", so Loki has to pick the right one and old runs can't mislead it
+  4. appends the true answer to runs.jsonl, so results can be scored later
 
 Set DEMO_DIR if the demo isn't cloned at ~/opentelemetry-demo.
 """
 import json
 import os
 import random
+import re
 import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +31,10 @@ FLAGS_FILE = DEMO_DIR / "src" / "flagd" / "demo.flagd.json"
 DEPLOYS_FILE = HERE / "state" / "deploys.json"
 RUNS_FILE = HERE / "runs.jsonl"
 LOKI_URL = os.environ.get("LOKI_AGENT_URL", "http://localhost:8088")
+PROM_URL = os.environ.get("LAB_PROM_URL", "http://localhost:9091")
+# Same expression and threshold as the HighErrorRate alert.
+ERROR_RATE = ('sum by (service_name) (rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m]))'
+              ' / sum by (service_name) (rate(traces_span_metrics_calls_total[5m])) > 0.05')
 
 # flag -> (service at fault, what the "bad deploy" changed, short diff).
 # Diffs carry no comments that name the problem: Loki has to find it in the evidence.
@@ -99,14 +106,32 @@ def _deploy(service, message, diff, minutes_ago):
     }
 
 
-def cmd_break(name):
+def _unhealthy():
+    """Services still above the alert's error rate, as {service: rate}."""
+    url = f"{PROM_URL}/api/v1/query?" + urllib.parse.urlencode({"query": ERROR_RATE})
+    with urllib.request.urlopen(url, timeout=10) as r:
+        result = json.load(r)["data"]["result"]
+    return {x["metric"].get("service_name", "?"): float(x["value"][1]) for x in result}
+
+
+def cmd_break(name, force=False):
     if name not in FAILURES:
         sys.exit(f"Unknown failure {name!r}. Run: python3 otel-demo/break.py list")
+    if not force:
+        try:
+            sick = _unhealthy()
+        except Exception as e:
+            sys.exit(f"Couldn't check the store's health at {PROM_URL}: {e}  (add --force to skip)")
+        if sick:
+            rates = ", ".join(f"{svc} {rate:.0%}" for svc, rate in sorted(sick.items()))
+            sys.exit(f"The store hasn't recovered yet ({rates} errors). Run reset if you haven't, "
+                     "wait a few minutes and try again, or add --force.")
     service, message, diff = FAILURES[name]
-    bad = _deploy(service, message, diff, minutes_ago=1)
-    innocent = _deploy(*random.choice([i for i in INNOCENT if i[0] != service]), minutes_ago=random.randint(3, 20))
-    deploys = _load(DEPLOYS_FILE, [])
-    deploys += [innocent, bad]
+    others = random.sample([i for i in INNOCENT if i[0] != service], 3)
+    deploys = [_deploy(*others[0], minutes_ago=random.randint(90, 180)),
+               _deploy(*others[1], minutes_ago=random.randint(30, 60)),
+               _deploy(*others[2], minutes_ago=random.randint(3, 20)),
+               bad := _deploy(service, message, diff, minutes_ago=1)]
     _save(DEPLOYS_FILE, deploys)
     _set_flag(name, True)
     with RUNS_FILE.open("a") as f:
@@ -139,21 +164,23 @@ def cmd_score():
         sys.exit(f"Couldn't read Loki's report from {LOKI_URL}: {e}")
     if "is running" in report and len(report) < 200:
         sys.exit(f"{report.strip()} Try again in a minute.")
-    text = report.lower()
-    got_service = truth["service"].lower() in text
-    got_deploy = truth["deploy_id"].lower() in text
+    # The report's verdict line: *Root cause* (payment, deploy 6fbf7a2): ...
+    m = re.search(r"\*Root cause\* \(([^,)]+)(?:, deploy ([0-9a-f]+))?\)", report)
+    blamed_service, blamed_deploy = (m.group(1).strip(), m.group(2)) if m else (None, None)
     print(report)
     print("\n" + "-" * 60)
     print(f"Truth: {truth['flag']} broke {truth['service']}, bad deploy {truth['deploy_id']}")
-    print(f"Named the right service: {'yes' if got_service else 'NO'}")
-    print(f"Named the right deploy:  {'yes' if got_deploy else 'NO'}")
-    print("(A quick text check. Read the report to judge whether the reasoning is right.)")
+    print(f"Loki blamed: {blamed_service or '(no root cause line)'}, deploy {blamed_deploy or '(none)'}")
+    print(f"Right service: {'yes' if blamed_service == truth['service'] else 'NO'}")
+    print(f"Right deploy:  {'yes' if blamed_deploy == truth['deploy_id'] else 'NO'}")
+    print("(Read the report too: a right answer can still rest on wrong reasoning.)")
 
 
 def main():
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != "--force"]
+    if len(args) != 1:
         sys.exit(__doc__)
-    arg = sys.argv[1]
+    arg = args[0]
     if arg == "list":
         for name, (service, message, _) in FAILURES.items():
             print(f"{name:28} breaks {service:16} \"{message}\"")
@@ -162,7 +189,7 @@ def main():
     elif arg == "score":
         cmd_score()
     else:
-        cmd_break(arg)
+        cmd_break(arg, force="--force" in sys.argv)
 
 
 if __name__ == "__main__":
