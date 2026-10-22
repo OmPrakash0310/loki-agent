@@ -106,7 +106,9 @@ TOOLS = [
             "properties": {
                 "summary": {"type": "string", "description": "One sentence: what broke and why."},
                 "root_cause": {"type": "string", "description": "The underlying cause, in 1-3 sentences."},
-                "root_cause_service": {"type": "string"},
+                "root_cause_service": {"type": "string", "description": (
+                    "Exactly one service or dependency name as written in the briefing, e.g. 'cart' or 'postgres'. "
+                    "No explanation here: put that in root_cause.")},
                 "trigger": {"type": "string", "enum": ["deploy", "infrastructure", "dependency", "traffic", "unknown"]},
                 "deploy_id": {"type": "string", "description": "The deploy that caused it, if trigger is deploy. Empty string otherwise."},
                 "affected_services": {"type": "array", "items": {"type": "string"}},

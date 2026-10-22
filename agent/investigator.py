@@ -13,6 +13,7 @@ Built to spend as little as possible:
 import json
 import logging
 import os
+import re
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -186,6 +187,21 @@ def _spent_today(conn) -> float:
     return float(row["spent"])
 
 
+def clean_service(value, known: set[str]) -> str:
+    """The report's service field must be a name, not prose: models sometimes write
+    'cart (due to Redis infrastructure failure'. Keep a known name the text starts
+    with (or contains, earliest first); otherwise its first word."""
+    text = str(value or "").strip()
+    if not text or text in known:
+        return text
+    found = [(m.start(), -len(name), name) for name in known
+             for m in [re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", text)] if m]
+    if found:
+        return min(found)[2]
+    first = re.match(r"[\w.:/-]+", text)
+    return first.group(0) if first else text
+
+
 def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing, budget: float,
               session: SimpleNamespace | None = None, max_steps: int | None = None):
     """Investigate with one model. Returns (report, steps, tokens_in, tokens_out, cost).
@@ -234,7 +250,8 @@ def _run_loop(conn, client, inv_id: int, model: str, briefing: context.Briefing,
         results = []
         for tu in tool_uses:
             if tu.name == "submit_report":
-                report = tu.input
+                report = dict(tu.input)
+                report["root_cause_service"] = clean_service(report.get("root_cause_service"), briefing.services)
                 session.submit_id = tu.id
                 _trace(conn, inv_id, step_no, tu.name, tu.input, "report submitted")
                 continue
