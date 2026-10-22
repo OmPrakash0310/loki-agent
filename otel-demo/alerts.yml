@@ -22,3 +22,17 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "{{ $labels.service_name }} p95 latency is {{ $value | humanize }}ms"
+      - alert: HighCpu
+        # Percent of one core, per container (docker_stats). Only the store's own services:
+        # the demo's infrastructure (collector, OpenSearch, Prometheus, load generator...) and
+        # this lab's containers are left out. Both label names are set: Loki reads `service`
+        # from Alertmanager, the other rules use `service_name`.
+        expr: |
+          label_replace(label_replace(
+            max by (container_name) (container_cpu_utilization_ratio{container_name!~"otel-collector|opensearch|prometheus|grafana|jaeger|load-generator|flagd.*|otel-demo-.*|kafka"}),
+            "service_name", "$1", "container_name", "(.*)"),
+            "service", "$1", "container_name", "(.*)") > 80
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service_name }} CPU is {{ $value | humanize }}% of a core"

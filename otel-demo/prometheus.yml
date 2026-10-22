@@ -15,6 +15,10 @@ scrape_configs:
     honor_labels: true
     metrics_path: /federate
     params:
-      "match[]": ['{__name__=~"traces_span_metrics_.+"}']
+      "match[]":
+        - '{__name__=~"traces_span_metrics_.+"}'
+        # Container CPU from the collector's docker_stats receiver: a CPU problem (adHighCpu)
+        # shows up here, not as errors or slow requests.
+        - '{__name__="container_cpu_utilization_ratio"}'
     static_configs:
       - targets: ["prometheus:9090"]
