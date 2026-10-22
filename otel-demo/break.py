@@ -7,7 +7,8 @@
     python3 otel-demo/break.py score              compare Loki's last report with the truth
 
 Turning a failure on does four things:
-  1. checks the store has recovered from the last failure (add --force to skip)
+  1. checks the store has recovered from the last failure: no error rate above the alert,
+     no alert firing or pending, no recent error logs from the target (add --force to skip)
   2. flips the demo's feature flag (flagd reads the file and applies it within seconds)
   3. starts a fresh deploy history: a few innocent deploys plus one matching "bad
      deploy", so Loki has to pick the right one and old runs can't mislead it
@@ -33,6 +34,11 @@ DEPLOYS_FILE = HERE / "state" / "deploys.json"
 RUNS_FILE = HERE / "runs.jsonl"
 LOKI_URL = os.environ.get("LOKI_AGENT_URL", "http://localhost:8088")
 PROM_URL = os.environ.get("LAB_PROM_URL", "http://localhost:9091")
+LOGS_URL = os.environ.get("LAB_LOGS_URL", "http://localhost:3100")
+# Error lines from the service about to be broken, in this window before the break,
+# mean the last failure isn't over: they would show up in Loki's briefing as if this
+# incident started before its deploy.
+QUIET_MINUTES = 5
 # Same expression and threshold as the HighErrorRate alert.
 ERROR_RATE = ('sum by (service_name) (rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m]))'
               ' / sum by (service_name) (rate(traces_span_metrics_calls_total[5m])) > 0.05')
@@ -115,6 +121,27 @@ def _unhealthy():
     return {x["metric"].get("service_name", "?"): float(x["value"][1]) for x in result}
 
 
+def _active_alerts():
+    """Alerts still firing or pending (any rule: errors, latency, CPU), as ['HighLatency checkout', ...]."""
+    url = f"{PROM_URL}/api/v1/query?" + urllib.parse.urlencode({"query": "ALERTS"})
+    with urllib.request.urlopen(url, timeout=10) as r:
+        result = json.load(r)["data"]["result"]
+    return sorted({f"{x['metric'].get('alertname')} {x['metric'].get('service_name', '?')} "
+                   f"({x['metric'].get('alertstate')})" for x in result})
+
+
+def _recent_errors(service):
+    """How many error-looking lines `service` logged in the last QUIET_MINUTES."""
+    now = datetime.now(timezone.utc)
+    q = urllib.parse.urlencode({
+        "query": f'{{service_name="{service}"}} |~ "(?i)error|exception|fail"',
+        "start": int((now - timedelta(minutes=QUIET_MINUTES)).timestamp() * 1e9),
+        "end": int(now.timestamp() * 1e9), "limit": 1000})
+    with urllib.request.urlopen(f"{LOGS_URL}/loki/api/v1/query_range?{q}", timeout=10) as r:
+        result = json.load(r)["data"]["result"]
+    return sum(len(s["values"]) for s in result)
+
+
 def cmd_break(name, force=False):
     if name not in FAILURES:
         sys.exit(f"Unknown failure {name!r}. Run: python3 otel-demo/break.py list")
@@ -127,6 +154,17 @@ def cmd_break(name, force=False):
             rates = ", ".join(f"{svc} {rate:.0%}" for svc, rate in sorted(sick.items()))
             sys.exit(f"The store hasn't recovered yet ({rates} errors). Run reset if you haven't, "
                      "wait a few minutes and try again, or add --force.")
+        service = FAILURES[name][0]
+        try:
+            alerts, errors = _active_alerts(), _recent_errors(service)
+        except Exception as e:
+            sys.exit(f"Couldn't check alerts at {PROM_URL} or logs at {LOGS_URL}: {e}  (add --force to skip)")
+        if alerts:
+            sys.exit("Alerts from the last failure are still active: " + "; ".join(alerts)
+                     + ". Wait until they clear (a few minutes after reset), or add --force.")
+        if errors:
+            sys.exit(f"{service} logged {errors} error line(s) in the last {QUIET_MINUTES} minutes. "
+                     "Loki would read them as part of this incident. Wait a few minutes, or add --force.")
     service, message, diff = FAILURES[name]
     others = random.sample([i for i in INNOCENT if i[0] != service], 3)
     deploys = [_deploy(*others[0], minutes_ago=random.randint(90, 180)),
