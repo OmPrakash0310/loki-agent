@@ -16,6 +16,7 @@ from fastapi import HTTPException
 
 import critic
 import share
+import tenant
 import verifier
 
 log = logging.getLogger("agent")
@@ -27,6 +28,20 @@ WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 # Where people can reach the agent from a browser, for the "View trace" link
 # (a signed, expiring /share/trace link, so it opens without an API key).
 PUBLIC_URL = os.environ.get("LOKI_PUBLIC_URL", "").rstrip("/")
+
+
+# Where reports go is per tenant (the default tenant keeps the variables above).
+# SIGNING_SECRET is the Slack app's, shared by every workspace that installed it.
+def _bot_token() -> str:
+    return BOT_TOKEN if tenant.current().is_default else tenant.setting("SLACK_BOT_TOKEN", "")
+
+
+def _channel() -> str:
+    return CHANNEL if tenant.current().is_default else tenant.setting("SLACK_CHANNEL", "")
+
+
+def _webhook_url() -> str:
+    return WEBHOOK_URL if tenant.current().is_default else tenant.setting("SLACK_WEBHOOK_URL", "")
 
 # Slack resends old requests in replay attacks; refuse anything older than this.
 MAX_REQUEST_AGE_S = 5 * 60
@@ -96,11 +111,12 @@ def post_report(inv_id: int, report: dict, steps: int, cost: float, text: str) -
     """Post a finished report. `text` is the plain rendering, used for the webhook
     fallback. Slack failures are logged, never raised: the report is already saved."""
     try:
-        if BOT_TOKEN and CHANNEL:
+        bot_token, channel, webhook_url = _bot_token(), _channel(), _webhook_url()
+        if bot_token and channel:
             resp = httpx.post(
                 "https://slack.com/api/chat.postMessage",
-                headers={"Authorization": f"Bearer {BOT_TOKEN}"},
-                json={"channel": CHANNEL, "text": f"Incident #{inv_id}: {report['summary']}",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                json={"channel": channel, "text": f"Incident #{inv_id}: {report['summary']}",
                       "blocks": build_blocks(inv_id, report, steps, cost)},
                 timeout=10,
             )
@@ -108,8 +124,8 @@ def post_report(inv_id: int, report: dict, steps: int, cost: float, text: str) -
             # The Web API answers 200 even on errors; the real result is in "ok".
             if not resp.json().get("ok"):
                 log.error("slack chat.postMessage failed: %s", resp.json().get("error"))
-        elif WEBHOOK_URL:
-            httpx.post(WEBHOOK_URL, json={"text": text}, timeout=10).raise_for_status()
+        elif webhook_url:
+            httpx.post(webhook_url, json={"text": text}, timeout=10).raise_for_status()
     except httpx.HTTPError as e:
         log.error("slack post failed: %s", e)
 

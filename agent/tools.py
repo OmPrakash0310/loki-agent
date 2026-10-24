@@ -12,6 +12,7 @@ import changepoint
 import db
 import embeddings
 import telemetry as tm
+import tenant
 from redact import redact
 
 MAX_OUTPUT_CHARS = 6000
@@ -361,6 +362,9 @@ def probe_endpoints() -> dict[str, str]:
 
 def probes_unavailable() -> str | None:
     """Why capture_variables can't be used right now, or None if it can."""
+    if not tenant.current().is_default:
+        # A probe reaches into a running service: only the operator's own deployment may.
+        return "live probes are only available on a single-customer deployment"
     if os.environ.get("LOKI_PROBES") != "1":
         return "live probes are off (LOKI_PROBES is not 1)"
     if not probe_endpoints():
@@ -478,7 +482,8 @@ def run(name: str, args: dict) -> tuple[str, bool]:
     if name in UNCACHED:
         return _run_uncached(name, args)
     replay_at = tm.replay_time()
-    key = name + json.dumps(args, sort_keys=True) + (replay_at.isoformat() if replay_at else "")
+    key = (f"{tenant.current_id()}|" + name + json.dumps(args, sort_keys=True)
+           + (replay_at.isoformat() if replay_at else ""))
     with _tool_cache_lock:
         hit = _tool_cache.get(key)
         if hit and time.monotonic() - hit[0] < TOOL_CACHE_TTL_S:

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 
 import httpx
 
+import tenant
+
 from redact import redact
 from sources import parse_mapping
 from sources.base import ErrorsSource
@@ -46,11 +48,11 @@ class SentryErrors(ErrorsSource):
 
     @classmethod
     def from_env(cls):
-        token, org = os.environ.get("SENTRY_TOKEN", ""), os.environ.get("SENTRY_ORG", "")
-        projects = parse_mapping(os.environ.get("SENTRY_PROJECTS", ""))
+        token, org = tenant.setting("SENTRY_TOKEN", ""), tenant.setting("SENTRY_ORG", "")
+        projects = parse_mapping(tenant.setting("SENTRY_PROJECTS", ""))
         if not (token and org and projects):
             raise ValueError("LOKI_ERRORS_SOURCE=sentry needs SENTRY_TOKEN, SENTRY_ORG and SENTRY_PROJECTS")
-        client = httpx.Client(base_url=(os.environ.get("SENTRY_BASE_URL") or "https://sentry.io").rstrip("/"),
+        client = httpx.Client(base_url=(tenant.setting("SENTRY_BASE_URL") or "https://sentry.io").rstrip("/"),
                               headers={"Authorization": f"Bearer {token}"}, timeout=15)
         return cls(org, projects, client)
 
