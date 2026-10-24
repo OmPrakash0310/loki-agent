@@ -120,6 +120,8 @@ PRESET_QUERIES = {
         "request_rate": 'sum(rate(http_server_request_duration_seconds_count{service_name="checkout"}[1m]))',
         "dependency": ('histogram_quantile(0.95, sum by (le, server_address) '
                        '(rate(http_client_request_duration_seconds_bucket{service_name="checkout"}[1m])))'),
+        "cpu_cores": 'sum(rate(process_cpu_time_seconds_total{service_name="checkout"}[1m]))',
+        "memory_bytes": 'sum(process_memory_usage_bytes{service_name="checkout"})',
         "logs": '{service_name="checkout"}',
         "all_logs": '{service_name=~".+", service_name!="agent"}',
         "services_match": "http_server_request_duration_seconds_count",
@@ -132,6 +134,8 @@ PRESET_QUERIES = {
         "request_rate": 'sum(rate(http_server_requests_seconds_count{application="checkout"}[1m]))',
         "dependency": ('histogram_quantile(0.95, sum by (le, client_name) '
                        '(rate(http_client_requests_seconds_bucket{application="checkout"}[1m])))'),
+        "cpu_cores": None,
+        "memory_bytes": 'sum(jvm_memory_used_bytes{application="checkout"})',
         "logs": '{application="checkout"}',
         "all_logs": '{application=~".+", application!="agent"}',
         "services_match": "http_server_requests_seconds_count",
@@ -143,6 +147,8 @@ PRESET_QUERIES = {
                                 '(rate(http_request_duration_seconds_bucket{job="checkout"}[1m])))'),
         "request_rate": 'sum(rate(http_request_duration_seconds_count{job="checkout"}[1m]))',
         "dependency": None,
+        "cpu_cores": 'sum(rate(process_cpu_seconds_total{job="checkout"}[1m]))',
+        "memory_bytes": 'sum(process_resident_memory_bytes{job="checkout"})',
         "logs": '{job="checkout"}',
         "all_logs": '{job=~".+", job!="agent"}',
         "services_match": "http_request_duration_seconds_count",
@@ -155,7 +161,12 @@ def test_preset_queries(monkeypatch, preset):
     monkeypatch.setenv("LOKI_METRICS_PRESET", preset)
     cfg, want = metrics_config.current(), PRESET_QUERIES[preset]
     for metric in metrics_config.METRIC_NAMES:
-        assert cfg.promql(metric, "checkout") == want[metric]
+        if want[metric] is None:
+            assert cfg.missing_reason(metric)
+            with pytest.raises(ValueError):
+                cfg.promql(metric, "checkout")
+        else:
+            assert cfg.promql(metric, "checkout") == want[metric]
     if want["dependency"]:
         assert cfg.dependency_promql("checkout") == want["dependency"]
     else:
@@ -196,7 +207,8 @@ def test_label_values_are_escaped():
 
 def test_rate_window_widens_every_range():
     cfg = metrics_config.MetricsConfig(rate_window="5m")
-    queries = [cfg.promql(m, "ad") for m in metrics_config.METRIC_NAMES] + [cfg.dependency_promql("ad")]
+    queries = [cfg.promql(m, "ad") for m in metrics_config.METRIC_NAMES if m != "memory_bytes"]  # a gauge: no range
+    queries += [cfg.dependency_promql("ad")]
     assert all("[5m]" in q and "[1m]" not in q for q in queries)
     with pytest.raises(ValueError, match="rate_window"):
         metrics_config.MetricsConfig(rate_window="5 min")
@@ -415,3 +427,33 @@ def test_discovery_reports_an_unreachable_prometheus(capsys):
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://prom")
     assert discover_metrics.main(["--prom", "http://prom"], client=client) == 1
     assert "could not read" in capsys.readouterr().err
+
+
+# ---------------- CPU and memory ----------------
+
+def test_default_cpu_and_memory_use_the_standard_process_metrics():
+    cfg = metrics_config.load()
+    assert cfg.promql("cpu_cores", "payments-svc") == 'sum(rate(process_cpu_seconds_total{service="payments-svc"}[1m]))'
+    assert cfg.promql("memory_bytes", "payments-svc") == 'sum(process_resident_memory_bytes{service="payments-svc"})'
+
+
+def test_container_metrics_through_resource_label():
+    cfg = metrics_config.MetricsConfig(cpu_seconds="container_cpu_usage_seconds_total",
+                                       memory_bytes="container_memory_working_set_bytes", resource_label="container")
+    assert cfg.promql("cpu_cores", "cart") == 'sum(rate(container_cpu_usage_seconds_total{container="cart"}[1m]))'
+    assert cfg.promql("memory_bytes", "cart") == 'sum(container_memory_working_set_bytes{container="cart"})'
+    assert cfg.promql("error_rate", "cart").count('service="cart"') == 2  # request metrics keep service_label
+
+
+def test_custom_cpu_query_escapes_the_service_and_is_assumed_present():
+    cfg = metrics_config.MetricsConfig(cpu_query='max(container_cpu_utilization_ratio{container_name="{service}"}) / 100')
+    assert cfg.promql("cpu_cores", 'a"b') == 'max(container_cpu_utilization_ratio{container_name="a\\"b"}) / 100'
+    assert cfg.families()["cpu"] is None
+    with pytest.raises(ValueError, match="must contain"):
+        metrics_config.MetricsConfig(memory_query="sum(container_memory_usage_bytes)")
+
+
+def test_cpu_and_memory_can_be_switched_off():
+    cfg = metrics_config.MetricsConfig(cpu_seconds=None, memory_bytes=None)
+    assert cfg.missing_reason("cpu_cores") == "no CPU metric configured"
+    assert cfg.missing_reason("memory_bytes") == "no memory metric configured"

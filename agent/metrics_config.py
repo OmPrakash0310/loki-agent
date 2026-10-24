@@ -16,13 +16,20 @@ Presets:
 
 A metric set to null is "not available": its briefing section is skipped with a
 note and the tools say so, instead of failing.
+
+CPU and memory come from the standard process metrics every official Prometheus
+client exposes (process_cpu_seconds_total, process_resident_memory_bytes). For
+container metrics (cAdvisor, Docker stats) set resource_label (e.g. "container"), or
+give a full query with cpu_query / memory_query, where {service} is the service name:
+
+    {"cpu_query": "sum(rate(container_cpu_usage_seconds_total{container=\"{service}\"}[5m]))"}
 """
 import json
 import os
 import re
 from dataclasses import dataclass, fields, replace
 
-METRIC_NAMES = ("error_rate", "p95_latency_seconds", "request_rate")
+METRIC_NAMES = ("error_rate", "p95_latency_seconds", "request_rate", "cpu_cores", "memory_bytes")
 
 _LABEL = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _METRIC = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
@@ -56,6 +63,16 @@ class MetricsConfig:
     # Multiplies latency histogram values into seconds: 0.001 for histograms in milliseconds
     # (OpenTelemetry span metrics). Applies to the request and dependency histograms.
     latency_scale: float = 1.0
+    # CPU: a counter of CPU seconds (rate() gives cores in use). None: no CPU metric.
+    cpu_seconds: str | None = "process_cpu_seconds_total"
+    # Memory in use, a gauge in bytes. None: no memory metric.
+    memory_bytes: str | None = "process_resident_memory_bytes"
+    # Label naming the service on the CPU/memory series, when it isn't service_label
+    # (cAdvisor and Docker stats use "container", Kubernetes often "pod").
+    resource_label: str | None = None
+    # Full PromQL overrides, with {service} where the (escaped) service name goes.
+    cpu_query: str | None = None
+    memory_query: str | None = None
 
     def __post_init__(self):
         for name in ("service_label", "dependency_label", "log_service_label"):
@@ -67,7 +84,13 @@ class MetricsConfig:
             raise ValueError(f"metrics config: latency_scale {self.latency_scale!r} must be a positive number")
         if not _WINDOW.match(self.rate_window or ""):
             raise ValueError(f"metrics config: rate_window {self.rate_window!r} is not a duration like 1m or 300s")
-        for name in ("requests", "latency_histogram", "dependency_histogram"):
+        if self.resource_label is not None and not _LABEL.match(self.resource_label):
+            raise ValueError(f"metrics config: resource_label {self.resource_label!r} is not a valid label name")
+        for name in ("cpu_query", "memory_query"):
+            q = getattr(self, name)
+            if q is not None and "{service}" not in q:
+                raise ValueError(f"metrics config: {name} must contain {{service}}")
+        for name in ("requests", "latency_histogram", "dependency_histogram", "cpu_seconds", "memory_bytes"):
             v = getattr(self, name)
             if v is not None and not _METRIC.match(v):
                 raise ValueError(f"metrics config: {name} {v!r} is not a valid metric name")
@@ -83,6 +106,10 @@ class MetricsConfig:
             raise ValueError(f"unknown metric {metric!r}; use one of {list(METRIC_NAMES)}")
         if metric == "p95_latency_seconds":
             return None if self.latency_histogram else "no latency metric configured"
+        if metric == "cpu_cores":
+            return None if (self.cpu_query or self.cpu_seconds) else "no CPU metric configured"
+        if metric == "memory_bytes":
+            return None if (self.memory_query or self.memory_bytes) else "no memory metric configured"
         if not self.requests:
             return "no request counter configured"
         if metric == "error_rate" and not self.status_label:
@@ -94,6 +121,8 @@ class MetricsConfig:
         if reason:
             raise ValueError(f"{metric}: {reason}")
         w = self.rate_window
+        if metric in ("cpu_cores", "memory_bytes"):
+            return self._resource_promql(metric, service)
         if metric == "error_rate":
             err = self._sel(service, f',{self.status_label}=~"{_esc(self.status_5xx)}"')
             return (f"(sum(rate({self.requests}{err}[{w}])) or vector(0))"
@@ -110,6 +139,15 @@ class MetricsConfig:
         return self._scaled(f"histogram_quantile(0.95, sum by (le, {self.dependency_label}) "
                             f"(rate({self.dependency_histogram}_bucket{self._sel(service)}[{w}])))")
 
+    def _resource_promql(self, metric: str, service: str) -> str:
+        custom = self.cpu_query if metric == "cpu_cores" else self.memory_query
+        if custom:
+            return custom.replace("{service}", _esc(service))
+        sel = "{" + f'{self.resource_label or self.service_label}="{_esc(service)}"' + "}"
+        if metric == "cpu_cores":
+            return f"sum(rate({self.cpu_seconds}{sel}[{self.rate_window}]))"
+        return f"sum({self.memory_bytes}{sel})"
+
     def _scaled(self, query: str) -> str:
         return query if self.latency_scale == 1 else f"({query}) * {self.latency_scale:g}"
 
@@ -125,6 +163,9 @@ class MetricsConfig:
             "requests": self.requests,
             "latency": f"{self.latency_histogram}_bucket" if self.latency_histogram else None,
             "dependency": f"{self.dependency_histogram}_bucket" if self.dependency_histogram else None,
+            # A custom query can't be checked by name: None here means "assume it exists".
+            "cpu": None if self.cpu_query else self.cpu_seconds,
+            "memory": None if self.memory_query else self.memory_bytes,
         }
 
     # ---------- LogQL ----------
@@ -152,6 +193,9 @@ PRESETS: dict[str, MetricsConfig] = {
         dependency_label="server_address",
         log_service_label="service_name",
         services_from_requests=True,
+        # OpenTelemetry process semantic conventions (process.cpu.time, process.memory.usage).
+        cpu_seconds="process_cpu_time_seconds_total",
+        memory_bytes="process_memory_usage_bytes",
     ),
     "spring": MetricsConfig(
         service_label="application",
@@ -162,6 +206,9 @@ PRESETS: dict[str, MetricsConfig] = {
         dependency_label="client_name",
         log_service_label="application",
         services_from_requests=True,
+        # Micrometer reports CPU as a usage ratio, not seconds: give a cpu_query to add it.
+        cpu_seconds=None,
+        memory_query='sum(jvm_memory_used_bytes{application="{service}"})',
     ),
     "express-prom": MetricsConfig(
         service_label="job",

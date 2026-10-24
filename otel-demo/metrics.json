@@ -9,5 +9,7 @@
   "log_service_label": "service_name",
   "services_from_requests": true,
   "rate_window": "5m",
-  "latency_scale": 0.001
+  "latency_scale": 0.001,
+  "cpu_query": "max(container_cpu_utilization_ratio{container_name=\"{service}\"}) / 100",
+  "memory_query": "max(container_memory_usage_total_bytes{container_name=\"{service}\"})"
 }

@@ -40,7 +40,8 @@ TOOLS = [
         "description": (
             "Get a metric for one service as a time series sampled every 30 seconds, plus min, max and the value "
             "before and after the window. Metrics: error_rate (fraction of requests returning 5xx), "
-            "p95_latency_seconds, request_rate (requests per second)."
+            "p95_latency_seconds, request_rate (requests per second), cpu_cores (CPU in use, in cores), "
+            "memory_bytes (memory in use)."
         ),
         "input_schema": {
             "type": "object",

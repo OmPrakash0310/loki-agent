@@ -12,3 +12,11 @@ scrape_configs:
   - job_name: services
     static_configs:
       - targets: ["shop-api:8000", "payments-svc:8000"]
+    # The client library's CPU/memory series (process_*) carry only instance="shop-api:8000".
+    # Give them the same service label the app's own metrics have. (Can't be a target label:
+    # it would rename the app metrics' own "service" label to exported_service.)
+    metric_relabel_configs:
+      - source_labels: [__name__, instance]
+        regex: "process_.+;([^:]+):.*"
+        target_label: service
+        replacement: "$1"
