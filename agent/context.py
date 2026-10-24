@@ -34,6 +34,7 @@ class Briefing:
     suspects: list[dict] = field(default_factory=list)
     onset: dict[str, datetime] = field(default_factory=dict)
     search_text: str = ""  # alerts + top error patterns: what to look up among past incidents
+    services: set[str] = field(default_factory=set)  # every service/dependency name the briefing mentions
 
 
 # A service's errors "start" at its first burst: an error followed by at least
@@ -284,9 +285,11 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
     # Dependencies: is a service slow because something it calls is slow?
     dep_spikes = []
     dep_lines = []
+    dep_names = set()
     for svc in tm.services_with_dependencies():
         b, n = tm.dependency_p95_at(svc, before - timedelta(minutes=2)), tm.dependency_p95_at(svc, end)
         for dep in sorted(set(b) | set(n)):
+            dep_names.add(dep)
             bv, nv = b.get(dep), n.get(dep)
             dep_lines.append(f"- {svc} -> {dep}: p95 {bv if bv is not None else 'no data'}s -> {nv if nv is not None else 'no data'}s")
             # A spike: 4x slower than before, or over 1s when there's no baseline to compare with.
@@ -366,4 +369,9 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
     search_text = "\n".join(
         [f"{i['alert_name']} on {i['service']}: {i['summary']}" for i in incidents]
         + [c["example"] for c in clusters[:5]])[:2000]
-    return Briefing("\n".join(out), fingerprint, exact_key, suspects, onset, search_text)
+    names = ({i["service"] for i in incidents} | set(onset) | {d["service"] for d in deploys} | dep_names
+             | {c["service"] for c in changes} | {s_["service"] for s_ in suspects})
+    for c in clusters:
+        names |= set(c["services"])
+    names = {n for n in names if n and n not in ("?", "unknown")}
+    return Briefing("\n".join(out), fingerprint, exact_key, suspects, onset, search_text, names)

@@ -44,8 +44,8 @@ def _get(kind: str, url: str, **kw):
 
 # Keep log lines that report a problem, plus exception summaries such as
 # "KeyError: 'currency'" or "java.lang.IllegalStateException: ...", "Caused by:"
-# chains, Go panics and JSON lines logged at error level (pino 50/60, winston,
-# zap, logrus). Skip stack-frame lines (Python "File ..., line 51", Java/Node
+# chains, Go panics, .NET console errors and JSON lines logged at error level
+# (pino 50/60, winston, zap, logrus). Skip stack-frame lines (Python "File ..., line 51", Java/Node
 # "at ...", Go "goroutine 1 [running]:" and "/app/x.go:42 +0x1d"), which would
 # otherwise drown out the one line that matters. A summary must end in ":", " [" or
 # the line end, so Go frames like "main.handleError(...)" stay out.
@@ -56,6 +56,10 @@ ERROR_FILTER = (
     r"|(^[\s|+]*([a-z_$][\w.$]*)?(error|exception|throwable)(:|\s*$|\s\[))"
     r"|(^\s*(caused by:|\[cause\]:|exception in thread |panic: |fatal error: ))"
     r"|(unhandledpromiserejection)"
+    # .NET console logger: "fail:"/"crit:" headers, and the message on an indented line
+    # that names the exception mid-line ("... System.ApplicationException: ...").
+    r"|(^(fail|crit): )"
+    r"|(^\s+\S.*[a-z]exception: )"
     r'|(\b(level|severity)"?\s*[:=]\s*"?(error|fatal|panic|dpanic|critical|50|60)\b)`'
 )
 

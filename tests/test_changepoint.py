@@ -205,3 +205,33 @@ def test_warm_up_of_a_series_that_starts_late_is_ignored(monkeypatch):
     b = context.build(INCIDENT)
     section = b.text.split("## When metrics changed")[1].split("\n\n")[0]
     assert "request_rate" not in section and "payments-svc error_rate jumped" in section
+
+
+# ---------------- the report's service field is a name ----------------
+
+import investigator  # noqa: E402
+
+KNOWN = {"cart", "frontend", "frontend-proxy", "checkout", "postgres", "payments-svc"}
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("cart (due to Redis infrastructure failure", "cart"),  # the OTel Demo lab, 2026-10-22
+    ("cart", "cart"),
+    ("frontend-proxy", "frontend-proxy"),  # not cut down to "frontend"
+    ("the frontend-proxy, via cart", "frontend-proxy"),  # earliest known name wins
+    ("postgres database", "postgres"),
+    ("payments-svc/charge", "payments-svc"),
+    ("valkey-cart (Redis)", "valkey-cart"),  # unknown name: first word
+    ("", ""),
+])
+def test_clean_service(value, expected):
+    assert investigator.clean_service(value, KNOWN) == expected
+
+
+def test_briefing_lists_the_services_it_mentions(monkeypatch):
+    install(monkeypatch, lambda svc, metric: flat(0.1), dep_fn=lambda i: 0.01,
+            deploys=[deploy("d0", "shop-api", 35)],
+            errors=[(at(50), "payments-svc", "KeyError: 'currency'")])
+    monkeypatch.setattr(tm, "dependency_p95_at", lambda s, t: {"postgres": 0.01})
+    b = context.build(INCIDENT)
+    assert {"payments-svc", "shop-api", "postgres"} <= b.services

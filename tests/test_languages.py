@@ -1,4 +1,4 @@
-"""Language-aware log processing: Java, Node.js/TypeScript, Go and Python.
+"""Language-aware log processing: Java, Node.js/TypeScript, Go, .NET and Python.
 
 The Python lock tests come first: answer-cache fingerprints are built from
 normalize() output, so the Python demo's patterns must never drift.
@@ -141,6 +141,21 @@ def test_filter_go_keeps_panics_and_error_json_skips_goroutine_dumps():
     got = kept("go_panic.log")
     assert len(got) == len(GO_KEPT_PREFIXES)
     assert all(l.startswith(p) for l, p in zip(got, GO_KEPT_PREFIXES))
+
+
+DOTNET_KEPT = [
+    "fail: cart.cartstore.ValkeyCartStore[0]",
+    "      Error status code 'FailedPrecondition' with detail 'Can't access cart storage. "
+    "System.ApplicationException: Wasn't able to connect to redis",
+    "crit: Microsoft.AspNetCore.Hosting.Diagnostics[6]",
+    "      System.InvalidOperationException: Unable to resolve service for type 'cart.cartstore.ICartStore'",
+]
+
+
+def test_filter_dotnet_keeps_fail_crit_and_exception_messages_skips_frames():
+    """Real lines from the OTel Demo's cart service (C#): Loki once reported
+    "no error logs" for an incident where cart logged the cause on every request."""
+    assert kept("dotnet_cart.log") == DOTNET_KEPT
 
 
 def test_filter_skips_frames_and_noise_in_every_language():

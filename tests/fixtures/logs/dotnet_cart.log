@@ -1,0 +1,18 @@
+info: Microsoft.Hosting.Lifetime[14]
+      Now listening on: http://[::]:7070
+info: cart.cartstore.ValkeyCartStore[0]
+      Successfully connected to Redis
+info: cart.services.CartService[0]
+      AddItemAsync called with userId=4f7a1c2e-9b3d-4e8a-a1f2-0c9d8e7f6a5b, productId=OLJCESPC7Z, quantity=1
+fail: cart.cartstore.ValkeyCartStore[0]
+      Error status code 'FailedPrecondition' with detail 'Can't access cart storage. System.ApplicationException: Wasn't able to connect to redis
+         at cart.cartstore.ValkeyCartStore.EnsureRedisConnected() in /app/src/cartstore/ValkeyCartStore.cs:line 123
+         at cart.cartstore.ValkeyCartStore.EmptyCartAsync(String userId) in /app/src/cartstore/ValkeyCartStore.cs:line 211'
+warn: Microsoft.AspNetCore.Server.Kestrel[0]
+      Overriding address(es) 'http://+:80'. Binding to endpoints defined via IConfiguration and/or UseKestrel() instead.
+crit: Microsoft.AspNetCore.Hosting.Diagnostics[6]
+      Application startup exception
+      System.InvalidOperationException: Unable to resolve service for type 'cart.cartstore.ICartStore'
+         at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteFactory.CreateArgumentCallSites(Type serviceType)
+dbug: cart.services.CartService[0]
+      GetCartAsync called with userId=4f7a1c2e-9b3d-4e8a-a1f2-0c9d8e7f6a5b
