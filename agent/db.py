@@ -1,4 +1,13 @@
-"""Postgres access for the agent: incidents, investigations, and their traces."""
+"""Postgres access for the agent: incidents, investigations, and their traces.
+
+Many customers (tenants, see tenant.py) share one database. Every table has a
+tenant_id, and row-level security makes Postgres itself show and accept only the
+current tenant's rows: connect() switches to the restricted role loki_app and sets
+loki.tenant. A query that forgets to filter by tenant returns nothing, not someone
+else's data. connect(admin=True) skips that, for the few operator-level jobs that
+must see every tenant (finding a tenant by its token, restart recovery, health).
+"""
+import logging
 import os
 
 import psycopg
@@ -7,6 +16,21 @@ from psycopg.rows import dict_row
 DB_URL = os.environ["DATABASE_URL"]
 
 SCHEMA = """
+-- Customers. Tenant 1 is the single-customer setup configured by environment variables.
+CREATE TABLE IF NOT EXISTS tenants (
+    id SERIAL PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    settings JSONB NOT NULL DEFAULT '{}',  -- non-secret per-customer settings
+    secrets TEXT,                          -- encrypted JSON (tenant.py, LOKI_SECRET_KEY)
+    webhook_token_hash TEXT UNIQUE,        -- sha256 of the ?token= its alert webhooks carry
+    api_key_hash TEXT UNIQUE,              -- sha256 of its API key
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO tenants (id, slug, name) VALUES (1, 'default', 'Default') ON CONFLICT (id) DO NOTHING;
+SELECT setval(pg_get_serial_sequence('tenants', 'id'), GREATEST((SELECT max(id) FROM tenants), 1));
+
 CREATE TABLE IF NOT EXISTS incidents (
     id SERIAL PRIMARY KEY,
     fingerprint TEXT NOT NULL,
@@ -124,10 +148,87 @@ CREATE TABLE IF NOT EXISTS lessons (
 """
 
 
-def connect():
-    return psycopg.connect(DB_URL, row_factory=dict_row, autocommit=True)
+TENANT_TABLES = ("incidents", "investigations", "report_cache", "trace_steps", "feedback", "audit_log", "lessons")
+
+# Run after SCHEMA. Idempotent: every startup re-applies it.
+TENANCY = "".join(f"""
+ALTER TABLE {t} ADD COLUMN IF NOT EXISTS tenant_id INT NOT NULL DEFAULT 1 REFERENCES tenants(id);
+ALTER TABLE {t} ALTER COLUMN tenant_id SET DEFAULT current_setting('loki.tenant', true)::int;
+CREATE INDEX IF NOT EXISTS {t}_tenant ON {t} (tenant_id);
+ALTER TABLE {t} ENABLE ROW LEVEL SECURITY;
+ALTER TABLE {t} FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON {t};
+CREATE POLICY tenant_isolation ON {t}
+    USING (tenant_id = current_setting('loki.tenant', true)::int OR current_setting('loki.admin', true) = 'on')
+    WITH CHECK (tenant_id = current_setting('loki.tenant', true)::int OR current_setting('loki.admin', true) = 'on');
+""" for t in TENANT_TABLES) + """
+-- Uniqueness is per tenant: two customers can both have an open "HighErrorRate:checkout".
+DROP INDEX IF EXISTS one_open_per_fingerprint;
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_per_tenant_fingerprint
+    ON incidents (tenant_id, fingerprint) WHERE status = 'open';
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                   WHERE i.indrelid = 'report_cache'::regclass AND i.indisprimary AND a.attname = 'tenant_id') THEN
+        ALTER TABLE report_cache DROP CONSTRAINT IF EXISTS report_cache_pkey;
+        ALTER TABLE report_cache ADD PRIMARY KEY (tenant_id, exact_key);
+    END IF;
+END $$;
+
+ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenants FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON tenants;
+CREATE POLICY tenant_isolation ON tenants
+    USING (id = current_setting('loki.tenant', true)::int OR current_setting('loki.admin', true) = 'on');
+"""
+
+# The restricted role every normal connection switches to. NOBYPASSRLS: the policies apply.
+ROLE = """
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'loki_app') THEN
+        CREATE ROLE loki_app NOLOGIN NOBYPASSRLS;
+    END IF;
+END $$;
+GRANT USAGE ON SCHEMA public TO loki_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO loki_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO loki_app;
+GRANT loki_app TO CURRENT_USER;
+"""
+
+log = logging.getLogger("agent")
+# False when the database user can't create or switch to loki_app (some managed
+# Postgres plans): then Loki runs as a single tenant only, and refuses to add tenants.
+_rls = {"ready": False}
+
+
+def rls_ready() -> bool:
+    return _rls["ready"]
+
+
+def connect(admin: bool = False):
+    import tenant
+    conn = psycopg.connect(DB_URL, row_factory=dict_row, autocommit=True)
+    if admin:
+        # Every tenant's rows. Superusers bypass row-level security anyway; a plain owner
+        # (some managed Postgres) needs this flag, which the policies honour.
+        conn.execute("SELECT set_config('loki.admin', 'on', false)")
+        return conn
+    if _rls["ready"]:
+        conn.execute("SET ROLE loki_app")
+    conn.execute("SELECT set_config('loki.admin', 'off', false), set_config('loki.tenant', %s, false)",
+                  (str(tenant.current_id()),))
+    return conn
 
 
 def init():
-    with connect() as conn:
+    with connect(admin=True) as conn:
         conn.execute(SCHEMA)
+        conn.execute(TENANCY)
+        try:
+            conn.execute(ROLE)
+            conn.execute("SET ROLE loki_app")
+            conn.execute("RESET ROLE")
+            _rls["ready"] = True
+        except psycopg.Error as e:
+            _rls["ready"] = False
+            log.warning("row-level security role unavailable (%s): running as a single tenant only",
+                        str(e).splitlines()[0])

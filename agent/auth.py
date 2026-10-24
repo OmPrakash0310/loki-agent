@@ -91,41 +91,94 @@ def _match(presented: str, keys: list[Key]) -> Key | None:
     return found
 
 
-def require_auth(request: Request):
-    """App-level dependency. Sets request.state.actor to the key name."""
+def _lookup(fn, value):
+    """A tenant from the database, or None. A database problem means "no such credential":
+    a 401, never a 500 that would hint the credential format was right."""
+    if not value:
+        return None
+    try:
+        import tenants
+        return fn(tenants)(value)
+    except Exception as e:  # noqa: BLE001
+        log.warning("tenant lookup failed: %s", type(e).__name__)
+        return None
+
+
+@dataclass(frozen=True)
+class Identity:
+    tenant: object
+    actor: str
+    scopes: frozenset = frozenset(SCOPES)
+    operator: bool = False  # a server key (LOKI_API_KEYS) or dev mode: may manage tenants
+
+
+def identify(request: Request) -> Identity:
+    """Who is calling, and for which tenant. Raises HTTPException(401/403/404).
+
+    Server keys (LOKI_API_KEYS) and LOKI_WEBHOOK_TOKEN belong to the default tenant; a
+    server key may act for another tenant with the header X-Loki-Tenant: <slug>. Each
+    other tenant has its own webhook token and API key (tenants.py)."""
+    import tenant as tenant_mod
+    default = tenant_mod.DEFAULT
     path = request.url.path
-    request.state.actor = "anonymous"
     if path in PUBLIC_PATHS:
-        return
+        return Identity(default, "anonymous")
     import share  # share imports auth
     m = share.PATH_RE.fullmatch(path)
     if m and request.method in SHARE_METHODS:
-        reason = share.verify(int(m.group(1)), request.query_params.get("exp", ""), request.query_params.get("sig", ""))
+        inv_id = int(m.group(1))
+        reason = share.verify(inv_id, request.query_params.get("exp", ""), request.query_params.get("sig", ""))
         if reason:
             raise HTTPException(403, reason)
-        request.state.actor = "share-link"
-        return
+        owner = _lookup(lambda t: t.of_investigation, inv_id)
+        return Identity(owner or default, "share-link", frozenset({"read"}))
     keys = _keys()
+    dev = not keys
     is_webhook = path == WEBHOOK_PREFIX or path.startswith(WEBHOOK_PREFIX + "/")
     if is_webhook:
         token, expected = request.query_params.get("token", ""), _webhook_token()
         if expected and token and hmac.compare_digest(token.encode(), expected.encode()):
-            request.state.actor = "webhook"
-            return
-        if not keys and not expected:
-            return  # dev mode
-    elif not keys:
-        return  # dev mode
+            return Identity(default, "webhook")
+        owner = _lookup(lambda t: t.by_webhook_token, token)
+        if owner:
+            return Identity(owner, f"webhook:{owner.slug}")
+        if dev and not expected:
+            return Identity(default, "anonymous", operator=True)
 
     header = request.headers.get("Authorization", "")
     scheme, _, presented = header.partition(" ")
-    key = _match(presented.strip(), keys) if scheme.lower() == "bearer" and presented.strip() else None
-    if key is None:
+    presented = presented.strip() if scheme.lower() == "bearer" else ""
+    key = _match(presented, keys) if presented else None
+    owner = None if key is not None else _lookup(lambda t: t.by_api_key, presented)
+    if key is not None:
+        identity = Identity(default, key.name, key.scopes, operator=True)
+    elif owner is not None:
+        identity = Identity(owner, f"{owner.slug}:api")
+    elif dev and not is_webhook:
+        identity = Identity(default, "anonymous", operator=True)  # dev mode: open, as always
+    else:
         raise HTTPException(401, "missing or invalid API key", headers={"WWW-Authenticate": "Bearer"})
     needed = "read" if request.method in READ_METHODS else "write"
-    if needed not in key.scopes:
-        raise HTTPException(403, f"key '{key.name}' lacks the {needed} scope")
-    request.state.actor = key.name
+    if needed not in identity.scopes:
+        raise HTTPException(403, f"key '{identity.actor}' lacks the {needed} scope")
+    acting = request.headers.get("X-Loki-Tenant", "").strip()
+    if acting and identity.operator:
+        target = _lookup(lambda t: t.by_slug, acting)
+        if target is None:
+            raise HTTPException(404, f"no tenant {acting!r}")
+        identity = Identity(target, f"{identity.actor}@{acting}", identity.scopes, operator=True)
+    return identity
+
+
+def require_auth(request: Request):
+    """App-level dependency. The identity was worked out by the tenant middleware in
+    main.py (which also selects the tenant for the request); this enforces it."""
+    found = getattr(request.state, "identity", None)
+    if found is None:  # the middleware isn't installed (a bare app in a test)
+        found = identify(request)
+    if isinstance(found, HTTPException):
+        raise found
+    request.state.actor = found.actor
 
 
 _TOKEN_RE = re.compile(r"((?:token|sig)=)[^&\s\"]+", re.IGNORECASE)

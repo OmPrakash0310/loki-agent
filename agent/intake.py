@@ -15,6 +15,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import tenant
 from sources import parse_mapping
 
 log = logging.getLogger("agent")
@@ -63,7 +64,7 @@ def ingest(conn, alerts: list[Alert], attach, start) -> list[dict]:
                 """
                 INSERT INTO incidents (fingerprint, alert_name, service, severity, summary, started_at)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (fingerprint) WHERE status = 'open' DO NOTHING
+                ON CONFLICT (tenant_id, fingerprint) WHERE status = 'open' DO NOTHING
                 RETURNING id
                 """,
                 (a.fingerprint, a.alert_name, a.service, a.severity, a.summary, a.starts_at),
@@ -127,7 +128,7 @@ def verify_grafana(body: bytes, headers, secret: str | None = None, now: float |
     """Grafana's optional webhook HMAC: hex HMAC-SHA256 of the raw body, or of
     "<timestamp>:<body>" when a timestamp header is configured. Header names are
     configurable in Grafana, so they are here too. No secret = not checked."""
-    secret = secret if secret is not None else os.environ.get("GRAFANA_WEBHOOK_SECRET", "")
+    secret = secret if secret is not None else tenant.setting("GRAFANA_WEBHOOK_SECRET", "")
     if not secret:
         return True
     sig_header = os.environ.get("GRAFANA_WEBHOOK_SIGNATURE_HEADER", "X-Grafana-Alerting-Signature")
@@ -158,7 +159,7 @@ def verify_sentry(body: bytes, signature: str, secret: str | None = None) -> boo
 
     Sentry's docs compute it over JSON.stringify(request.body); Loki uses the raw
     bytes, which is the same string unless something re-serializes the body."""
-    secret = secret if secret is not None else os.environ.get("SENTRY_WEBHOOK_SECRET", "")
+    secret = secret if secret is not None else tenant.setting("SENTRY_WEBHOOK_SECRET", "")
     if not secret:
         return True
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
@@ -166,7 +167,7 @@ def verify_sentry(body: bytes, signature: str, secret: str | None = None) -> boo
 
 
 def _sentry_service(slug: str | None) -> str:
-    projects = parse_mapping(os.environ.get("SENTRY_PROJECTS", ""))
+    projects = parse_mapping(tenant.setting("SENTRY_PROJECTS", ""))
     return projects.get(slug or "", slug or "unknown")
 
 
@@ -264,7 +265,7 @@ def from_datadog(payload) -> list[Alert]:
 
 def verify_pagerduty(body: bytes, header: str, secret: str | None = None) -> bool:
     """X-PagerDuty-Signature is "v1=<hex hmac-sha256>", possibly several, comma-separated."""
-    secret = secret if secret is not None else os.environ.get("PAGERDUTY_WEBHOOK_SECRET", "")
+    secret = secret if secret is not None else tenant.setting("PAGERDUTY_WEBHOOK_SECRET", "")
     if not secret:
         return True
     expected = "v1=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()

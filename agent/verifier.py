@@ -61,7 +61,9 @@ LABELS = {
 
 def enabled() -> bool:
     # Read on every call so tests (and operators) can flip it without a restart.
-    return os.environ.get("LOKI_VERIFY", "").strip() == "1"
+    # Only for the operator's own deployment: it runs the customer's images on this host.
+    import tenant
+    return os.environ.get("LOKI_VERIFY", "").strip() == "1" and tenant.current().is_default
 
 
 # ---------- talking to Docker ----------

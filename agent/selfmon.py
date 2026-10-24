@@ -43,7 +43,7 @@ def heartbeat_age(now: float | None = None) -> float | None:
 
 def db_ok() -> bool:
     try:
-        with db.connect() as conn:
+        with db.connect(admin=True) as conn:
             conn.execute("SELECT 1").fetchone()
         return True
     except Exception as e:  # noqa: BLE001 - any failure means not ready
@@ -98,7 +98,7 @@ def check_failures(conn, now: float | None = None, post=None) -> bool:
 def _tick():
     _state["beat"] = time.time()
     try:
-        with db.connect() as conn:
+        with db.connect(admin=True) as conn:  # the operator's view: every tenant's failures
             check_failures(conn)
     except Exception as e:  # noqa: BLE001
         log.warning("health worker: %s", type(e).__name__)
