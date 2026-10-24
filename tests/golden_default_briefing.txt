@@ -4,8 +4,8 @@
 - 16:22:00 HighErrorRate on payments-svc (critical): 5xx > 5%
 
 ## Metrics: typical value before the first alert -> now
-- payments-svc: error_rate 0.02 -> 0.25; p95_latency_seconds 0.02 -> 0.25; request_rate 0.02 -> 0.25
-- shop-api: error_rate 0.02 -> 0.25; p95_latency_seconds 0.02 -> 0.25; request_rate 0.02 -> 0.25
+- payments-svc: error_rate 0.02 -> 0.25; p95_latency_seconds 0.02 -> 0.25; request_rate 0.02 -> 0.25; cpu_cores 0.02 -> 0.25; memory_bytes 0.02 -> 0.25
+- shop-api: error_rate 0.02 -> 0.25; p95_latency_seconds 0.02 -> 0.25; request_rate 0.02 -> 0.25; cpu_cores 0.02 -> 0.25; memory_bytes 0.02 -> 0.25
 
 ## Dependency latency (calls from a service to its database / external APIs): before -> now
 - payments-svc -> postgres: p95 0.012s -> 0.012s

@@ -145,6 +145,8 @@ THRESHOLDS = {
     "p95_latency_seconds": {"min_abs": 0.05, "min_rel": 0.5},  # at least 50 ms, and +50%
     "request_rate": {"min_abs": 0.0, "min_rel": 0.3},  # traffic up or down by 30%
     "dependency_p95": {"min_abs": 0.05, "min_rel": 0.5},
+    "cpu_cores": {"min_abs": 0.1, "min_rel": 0.5},  # at least a tenth of a core, and +50%
+    "memory_bytes": {"min_abs": 50e6, "min_rel": 0.2},  # at least 50 MB, and +20% (leaks creep)
 }
 
 

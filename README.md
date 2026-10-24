@@ -848,6 +848,23 @@ investigated), `services_from_requests` (list services from the request metric o
 unrelated scrape jobs don't show up; on in every preset except `default`). In Docker,
 mount the file into the agent container and give its path there.
 
+**CPU and memory** (`cpu_cores`, `memory_bytes`) come from the process metrics every official
+Prometheus client exposes: `process_cpu_seconds_total` and `process_resident_memory_bytes`
+(`otel`: `process_cpu_time_seconds_total` and `process_memory_usage_bytes`; `spring`:
+`jvm_memory_used_bytes`, no CPU). For container metrics, set `resource_label` to the label
+that names the service there, or give a full query with `{service}` where the name goes:
+
+```json
+{"cpu_seconds": "container_cpu_usage_seconds_total", "memory_bytes": "container_memory_working_set_bytes",
+ "resource_label": "container"}
+{"cpu_query": "max(container_cpu_utilization_ratio{container_name=\"{service}\"}) / 100"}
+```
+
+`cpu_seconds: null` or `memory_bytes: null` turns one off. They appear in the briefing's
+before/after table, in change-point detection ("cpu_cores rose gradually …") and in the
+`query_metrics` tool, so a CPU or memory problem is visible even when requests still
+succeed quickly.
+
 **Find your names.** Point the discovery helper at your Prometheus. It only sends GET
 requests, lists candidate request counters, latency histograms and their labels, names
 the closest preset and prints a config to start from:

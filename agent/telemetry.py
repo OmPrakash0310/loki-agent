@@ -295,6 +295,10 @@ def metric_unavailable(metric: str) -> str | None:
     fam = cfg.families()
     if metric == "p95_latency_seconds":
         return _family_missing(fam["latency"], "latency")
+    if metric == "cpu_cores":
+        return None if cfg.cpu_query else _family_missing(fam["cpu"], "CPU")
+    if metric == "memory_bytes":
+        return None if cfg.memory_query else _family_missing(fam["memory"], "memory")
     return _family_missing(fam["requests"], "request counter")
 
 

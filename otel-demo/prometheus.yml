@@ -20,5 +20,6 @@ scrape_configs:
         # Container CPU from the collector's docker_stats receiver: a CPU problem (adHighCpu)
         # shows up here, not as errors or slow requests.
         - '{__name__="container_cpu_utilization_ratio"}'
+        - '{__name__="container_memory_usage_total_bytes"}'
     static_configs:
       - targets: ["prometheus:9090"]
