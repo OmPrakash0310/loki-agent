@@ -36,12 +36,54 @@ class Briefing:
     search_text: str = ""  # alerts + top error patterns: what to look up among past incidents
 
 
-def _error_onset(lines) -> dict[str, datetime]:
-    """When each service logged its first error in the window."""
-    onset: dict[str, datetime] = {}
+# A service's errors "start" at its first burst: an error followed by at least
+# BURST_COUNT - 1 more within BURST_WINDOW. One stray line (a startup hiccup, a leftover
+# from the previous incident) must not set the start, or a deploy that came after it
+# looks innocent. A service that never bursts falls back to its first error.
+BURST_COUNT = 3
+BURST_WINDOW = timedelta(seconds=60)
+
+
+def _error_times(lines) -> dict[str, list[datetime]]:
+    times: dict[str, list[datetime]] = {}
     for t, svc, _ in lines:
-        onset.setdefault(svc, t)
+        times.setdefault(svc, []).append(t)
+    return {svc: sorted(ts) for svc, ts in times.items()}
+
+
+def _burst_start(ts: list[datetime]) -> datetime:
+    for i in range(len(ts) - BURST_COUNT + 1):
+        if ts[i + BURST_COUNT - 1] - ts[i] <= BURST_WINDOW:
+            return ts[i]
+    return ts[0]
+
+
+def _error_onset(lines) -> dict[str, datetime]:
+    """When each service's errors started: its first burst (see BURST_COUNT)."""
+    onset = {svc: _burst_start(ts) for svc, ts in _error_times(lines).items()}
     return dict(sorted(onset.items(), key=lambda kv: kv[1]))
+
+
+def _bursting(lines) -> set[str]:
+    """Services whose errors include at least one burst."""
+    out = set()
+    for svc, ts in _error_times(lines).items():
+        if any(ts[i + BURST_COUNT - 1] - ts[i] <= BURST_WINDOW for i in range(len(ts) - BURST_COUNT + 1)):
+            out.add(svc)
+    return out
+
+
+def _leading_onset(lines, onset: dict[str, datetime]) -> dict[str, datetime]:
+    """The onsets that decide when and where the incident started: only services with a
+    burst, when any service has one. A service with a single stray line can't lead."""
+    bursting = _bursting(lines)
+    return {s: t for s, t in onset.items() if s in bursting} or onset
+
+
+def _isolated_before(lines, onset: dict[str, datetime]) -> dict[str, list[datetime]]:
+    """Error lines each service logged before its burst: shown, but not used as the start."""
+    return {svc: [t for t in ts if t < onset[svc]] for svc, ts in _error_times(lines).items()
+            if any(t < onset[svc] for t in ts)}
 
 
 def source_service(onset: dict[str, datetime], clusters: list[dict]) -> tuple[str | None, str]:
@@ -270,7 +312,12 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
         out.append(f"- x{c['count']} in {', '.join(c['services'])} ({c['first_seen']} to {c['last_seen']}): {c['example']}")
     out += [f"- note: {n}" for n in tm.error_notes()]
     if onset:
-        out.append("- first error per service: " + ", ".join(f"{s} {tm._hms(t)}" for s, t in onset.items()))
+        isolated = _isolated_before(lines, onset)
+        label = "errors started per service (first burst)" if isolated else "first error per service"
+        out.append(f"- {label}: " + ", ".join(f"{s} {tm._hms(t)}" for s, t in onset.items()))
+        for svc, ts in isolated.items():
+            out.append(f"- {svc} also logged {len(ts)} isolated error line(s) before that, from {tm._hms(ts[0])}: "
+                       "too few to start an incident; possibly unrelated or left over from an earlier one")
     if floor and floor > first_alert - LOOKBACK:
         out.append(f"- (window starts at {tm._hms(floor)}, when the previous incident was resolved; "
                    "earlier errors belong to that incident)")
@@ -304,7 +351,8 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
                 "rate-based metrics trail the logs by up to ~30s, so the first error time is the sharper clock)",
                 *_change_lines(changes, deploys, onset)]
 
-    suspects = rank_suspects(onset, clusters, deploys, incidents, dep_spikes, floor)
+    lead = _leading_onset(lines, onset)
+    suspects = rank_suspects(lead, clusters, deploys, incidents, dep_spikes, floor)
     _deploy_timing_reasons(suspects, deploys, changes)
     out += ["", "## Suspects ranked by simple rules (a starting point: verify, don't trust blindly)"]
     for n, s in enumerate(suspects, 1):
@@ -314,7 +362,7 @@ def build(incidents: list[dict], floor: datetime | None = None) -> Briefing:
         out.append(f"{n}. {name} (score {s['score']}): {'; '.join(s['reasons'])}")
 
     out += ["", f"Current time: {tm._hms(end)} UTC."]
-    fingerprint, exact_key = _fingerprint(source_service(onset, clusters)[0], clusters, suspects, incidents)
+    fingerprint, exact_key = _fingerprint(source_service(lead, clusters)[0], clusters, suspects, incidents)
     search_text = "\n".join(
         [f"{i['alert_name']} on {i['service']}: {i['summary']}" for i in incidents]
         + [c["example"] for c in clusters[:5]])[:2000]
