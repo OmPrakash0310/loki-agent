@@ -19,6 +19,7 @@ import httpx
 import logparse
 import metrics_config
 import sources
+import tenant
 from sources import httpkit
 from redact import redact
 
@@ -34,6 +35,23 @@ PROM_URL = (os.environ["LOKI_PROM_URL"].strip() if "LOKI_PROM_URL" in os.environ
 if PROM_URL.lower() in ("off", "none"):
     PROM_URL = ""
 DEPLOYS_FILE = os.environ.get("DEPLOYS_FILE", "/state/deploys.json")
+
+
+def _norm_url(u) -> str:
+    u = (u or "").strip()
+    return "" if u.lower() in ("off", "none") else u.rstrip("/")
+
+
+def loki_url() -> str:
+    """Grafana Loki for the current tenant. The default tenant keeps LOKI_URL above (the
+    demo default included); other tenants only have one if they configured it."""
+    return LOKI_URL if tenant.current().is_default else _norm_url(tenant.setting("LOKI_URL"))
+
+
+def prom_url() -> str:
+    if tenant.current().is_default:
+        return PROM_URL
+    return _norm_url(tenant.setting("LOKI_PROM_URL") or tenant.setting("PROM_URL"))
 
 
 def _get(kind: str, url: str, **kw):
@@ -121,10 +139,10 @@ def fetch_logs(service: str | None, start: datetime, end: datetime, errors_only:
     selector = cfg.log_selector(service)
     query = selector + (" " + ERROR_FILTER if errors_only else "")
     end = _cap(end)
-    if start >= end or not LOKI_URL:
+    if start >= end or not loki_url():
         return []
     resp = _get(
-        "LOGS", f"{LOKI_URL}/loki/api/v1/query_range",
+        "LOGS", f"{loki_url()}/loki/api/v1/query_range",
         params={"query": query, "start": _ns(start), "end": _ns(end), "limit": limit, "direction": "backward"},
         timeout=20,
     )
@@ -237,7 +255,7 @@ METRICS = metrics_config.METRIC_NAMES
 
 
 def prom_enabled() -> bool:
-    return bool(PROM_URL)
+    return bool(prom_url())
 
 
 def _cfg() -> metrics_config.MetricsConfig:
@@ -248,23 +266,23 @@ def _cfg() -> metrics_config.MetricsConfig:
 # that fails (old Prometheus, a compatible backend without the API) counts as
 # "assume present", so the queries run and simply return no data as before.
 NAMES_TTL_S = 300
-_names_cache: dict[str, tuple[float, frozenset | None]] = {}
+_names_cache: dict[tuple, tuple[float, frozenset | None]] = {}
 _names_lock = threading.Lock()
 
 
 def _metric_names() -> frozenset | None:
     with _names_lock:
-        hit = _names_cache.get(PROM_URL)
+        hit = _names_cache.get((tenant.current_id(), prom_url()))
         if hit and time.monotonic() - hit[0] < NAMES_TTL_S:
             return hit[1]
     try:
-        resp = _get("PROM", f"{PROM_URL}/api/v1/label/__name__/values", timeout=10)
+        resp = _get("PROM", f"{prom_url()}/api/v1/label/__name__/values", timeout=10)
         resp.raise_for_status()
         names = frozenset(resp.json()["data"])
     except Exception:
         names = None
     with _names_lock:
-        _names_cache[PROM_URL] = (time.monotonic(), names)
+        _names_cache[(tenant.current_id(), prom_url())] = (time.monotonic(), names)
     return names
 
 
@@ -318,7 +336,7 @@ def services() -> list[str]:
     cfg = _cfg()
     match = cfg.services_match()
     params = {"match[]": match, **_label_window()} if match else _label_window()
-    resp = _get("PROM", f"{PROM_URL}/api/v1/label/{cfg.service_label}/values", params=params, timeout=10)
+    resp = _get("PROM", f"{prom_url()}/api/v1/label/{cfg.service_label}/values", params=params, timeout=10)
     resp.raise_for_status()
     return resp.json()["data"]
 
@@ -332,7 +350,7 @@ def metric_series(metric: str, service: str, start: datetime, end: datetime, ste
         return []
     resp = _get(
         "PROM",
-        f"{PROM_URL}/api/v1/query_range",
+        f"{prom_url()}/api/v1/query_range",
         params={"query": query, "start": start.timestamp(), "end": end.timestamp(), "step": step_s},
         timeout=20,
     )
@@ -364,7 +382,7 @@ def metric_at(metric: str, service: str, at: datetime):
     at = _cap(at)
     resp = _get(
         "PROM",
-        f"{PROM_URL}/api/v1/query",
+        f"{prom_url()}/api/v1/query",
         params={"query": _cfg().promql(metric, service), "time": at.timestamp()},
         timeout=10,
     )
@@ -382,7 +400,7 @@ def dependency_p95_at(service: str, at: datetime) -> dict[str, float]:
         return {}
     cfg = _cfg()
     at = _cap(at)
-    resp = _get("PROM", f"{PROM_URL}/api/v1/query", params={"query": cfg.dependency_promql(service), "time": at.timestamp()}, timeout=10)
+    resp = _get("PROM", f"{prom_url()}/api/v1/query", params={"query": cfg.dependency_promql(service), "time": at.timestamp()}, timeout=10)
     resp.raise_for_status()
     out = {}
     for r in resp.json()["data"]["result"]:
@@ -401,7 +419,7 @@ def dependency_p95_series(service: str, start: datetime, end: datetime, step_s: 
         return {}
     resp = _get(
         "PROM",
-        f"{PROM_URL}/api/v1/query_range",
+        f"{prom_url()}/api/v1/query_range",
         params={"query": cfg.dependency_promql(service), "start": start.timestamp(), "end": end.timestamp(), "step": step_s},
         timeout=20,
     )
@@ -417,7 +435,7 @@ def services_with_dependencies() -> list[str]:
     if dependency_unavailable():
         return []
     cfg = _cfg()
-    resp = _get("PROM", f"{PROM_URL}/api/v1/label/{cfg.service_label}/values",
+    resp = _get("PROM", f"{prom_url()}/api/v1/label/{cfg.service_label}/values",
                      params={"match[]": f"{cfg.dependency_histogram}_count", **_label_window()}, timeout=10)
     resp.raise_for_status()
     return resp.json()["data"]

@@ -204,11 +204,11 @@ def test_doctor_webhook_urls_mask_token(env):
 # ---------------- readiness ----------------
 
 def test_readiness(monkeypatch):
-    monkeypatch.setattr(selfmon.db, "connect", lambda: FakeConn())
+    monkeypatch.setattr(selfmon.db, "connect", lambda **kw: FakeConn())
     monkeypatch.setitem(selfmon._state, "beat", 1000.0)
     assert selfmon.readiness(now=1010.0) == (True, {"database": True, "worker": True})
     assert selfmon.readiness(now=1000.0 + selfmon.HEARTBEAT_STALE_S + 1)[0] is False
-    monkeypatch.setattr(selfmon.db, "connect", lambda: FakeConn(fail=True))
+    monkeypatch.setattr(selfmon.db, "connect", lambda **kw: FakeConn(fail=True))
     assert selfmon.readiness(now=1010.0) == (False, {"database": False, "worker": True})
     monkeypatch.setitem(selfmon._state, "beat", 0.0)
     assert selfmon.readiness()[1]["worker"] is False

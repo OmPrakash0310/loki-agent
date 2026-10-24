@@ -8,3 +8,5 @@ anthropic==1.15.0
 httpx==0.27.2
 # Local text embeddings for similar-incident search (embeddings.py). CPU only, via onnxruntime.
 fastembed==0.9.0
+# Encrypts customers' secrets at rest (tenant.py, LOKI_SECRET_KEY).
+cryptography==50.0.2

@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 
 import httpx
 
+import tenant
+
 from redact import redact
 from sources.base import ErrorsSource
 from sources.httpkit import RateLimited
@@ -39,10 +41,10 @@ def _ts(s: str) -> datetime:
 
 
 def _base_url() -> str:
-    override = os.environ.get("DATADOG_BASE_URL", "").strip()
+    override = tenant.setting("DATADOG_BASE_URL", "").strip()
     if override:
         return override.rstrip("/")
-    site = (os.environ.get("DATADOG_SITE") or "datadoghq.com").strip().lower()
+    site = (tenant.setting("DATADOG_SITE") or "datadoghq.com").strip().lower()
     if not _SITE.match(site):
         raise ValueError(f"DATADOG_SITE {site!r} is not a valid Datadog site, e.g. datadoghq.com or datadoghq.eu")
     return f"https://api.{site}"
@@ -50,8 +52,7 @@ def _base_url() -> str:
 
 def auth_headers() -> dict:
     """Classic API + application key, or a bearer token. Raises ValueError when neither is set."""
-    env = os.environ
-    api, app, token = (env.get(k, "").strip() for k in ("DATADOG_API_KEY", "DATADOG_APP_KEY", "DATADOG_TOKEN"))
+    api, app, token = (tenant.setting(k, "").strip() for k in ("DATADOG_API_KEY", "DATADOG_APP_KEY", "DATADOG_TOKEN"))
     if token:
         return {"Authorization": f"Bearer {token}"}
     if api and app:
@@ -81,7 +82,7 @@ class DatadogErrors(ErrorsSource):
     def from_env(cls):
         headers = auth_headers()
         client = httpx.Client(base_url=_base_url(), headers={**headers, "Content-Type": "application/json"}, timeout=20)
-        return cls(client, os.environ.get("DATADOG_LOG_QUERY", ""))
+        return cls(client, tenant.setting("DATADOG_LOG_QUERY", ""))
 
     def notes(self):
         return list(self._notes)
