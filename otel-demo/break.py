@@ -3,6 +3,7 @@
 
     python3 otel-demo/break.py list               the failures you can cause
     python3 otel-demo/break.py paymentFailure     turn one on
+    python3 otel-demo/break.py paymentFailure --deploy none   ...with no matching deploy (or: old)
     python3 otel-demo/break.py reset              turn everything off
     python3 otel-demo/break.py score              compare Loki's last report with the truth
 
@@ -142,41 +143,104 @@ def _recent_errors(service):
     return sum(len(s["values"]) for s in result)
 
 
-def cmd_break(name, force=False):
-    if name not in FAILURES:
-        sys.exit(f"Unknown failure {name!r}. Run: python3 otel-demo/break.py list")
-    if not force:
-        try:
-            sick = _unhealthy()
-        except Exception as e:
-            sys.exit(f"Couldn't check the store's health at {PROM_URL}: {e}  (add --force to skip)")
-        if sick:
-            rates = ", ".join(f"{svc} {rate:.0%}" for svc, rate in sorted(sick.items()))
-            sys.exit(f"The store hasn't recovered yet ({rates} errors). Run reset if you haven't, "
-                     "wait a few minutes and try again, or add --force.")
-        service = FAILURES[name][0]
-        try:
-            alerts, errors = _active_alerts(), _recent_errors(service)
-        except Exception as e:
-            sys.exit(f"Couldn't check alerts at {PROM_URL} or logs at {LOGS_URL}: {e}  (add --force to skip)")
-        if alerts:
-            sys.exit("Alerts from the last failure are still active: " + "; ".join(alerts)
-                     + ". Wait until they clear (a few minutes after reset), or add --force.")
-        if errors:
-            sys.exit(f"{service} logged {errors} error line(s) in the last {QUIET_MINUTES} minutes. "
-                     "Loki would read them as part of this incident. Wait a few minutes, or add --force.")
+DEPLOY_MODES = {
+    # The matching "bad deploy" went out a minute before the failure: the classic case.
+    "fresh": (1, 1),
+    # No matching deploy at all, only innocent ones (one of them minutes old): Loki must
+    # name the service and blame no deploy.
+    "none": None,
+    # The matching deploy went out hours ago, long before anything broke: blaming it is wrong.
+    "old": (180, 300),
+}
+
+
+def not_recovered(service, force=False):
+    """Why the store isn't ready for a new failure in `service`, or None when it is."""
+    if force:
+        return None
+    try:
+        sick = _unhealthy()
+    except Exception as e:
+        return f"Couldn't check the store's health at {PROM_URL}: {e}"
+    if sick:
+        rates = ", ".join(f"{svc} {rate:.0%}" for svc, rate in sorted(sick.items()))
+        return f"The store hasn't recovered yet ({rates} errors)."
+    try:
+        alerts, errors = _active_alerts(), _recent_errors(service)
+    except Exception as e:
+        return f"Couldn't check alerts at {PROM_URL} or logs at {LOGS_URL}: {e}"
+    if alerts:
+        return "Alerts from the last failure are still active: " + "; ".join(alerts) + "."
+    if errors:
+        return (f"{service} logged {errors} error line(s) in the last {QUIET_MINUTES} minutes; "
+                "Loki would read them as part of this incident.")
+    return None
+
+
+def do_break(name, deploy_mode="fresh"):
+    """Turn failure `name` on with a fresh deploy history; record and return the truth."""
     service, message, diff = FAILURES[name]
     others = random.sample([i for i in INNOCENT if i[0] != service], 3)
     deploys = [_deploy(*others[0], minutes_ago=random.randint(90, 180)),
                _deploy(*others[1], minutes_ago=random.randint(30, 60)),
-               _deploy(*others[2], minutes_ago=random.randint(3, 20)),
-               bad := _deploy(service, message, diff, minutes_ago=1)]
+               _deploy(*others[2], minutes_ago=random.randint(3, 20))]
+    age = DEPLOY_MODES[deploy_mode]
+    bad = _deploy(service, message, diff, minutes_ago=random.randint(*age)) if age else None
+    if bad:
+        deploys.append(bad)
+    deploys.sort(key=lambda d: d["deployed_at"])
     _save(DEPLOYS_FILE, deploys)
     _set_flag(name, True)
+    truth = {"started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "flag": name, "service": service, "deploy_mode": deploy_mode,
+             # Only a fresh matching deploy is the right one to blame.
+             "deploy_id": bad["id"] if bad and deploy_mode == "fresh" else None,
+             "matching_deploy": bad["id"] if bad else None}
     with RUNS_FILE.open("a") as f:
-        f.write(json.dumps({"started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                            "flag": name, "service": service, "deploy_id": bad["id"]}) + "\n")
-    print(f"Broke {service} ({name}). Bad deploy {bad['id']}: \"{message}\".")
+        f.write(json.dumps(truth) + "\n")
+    return truth
+
+
+def find_report(truth):
+    """("waiting", None), ("running", inv) or ("done", inv): the first live investigation
+    opened after this break, not one left from an earlier run. inv has its report text."""
+    started = datetime.fromisoformat(truth["started_at"])
+    with urllib.request.urlopen(f"{LOKI_URL}/investigations", timeout=10) as r:
+        invs = json.load(r)
+    mine = [i for i in invs if i["mode"] == "live" and datetime.fromisoformat(i["created_at"]) >= started]
+    if not mine:
+        return "waiting", None
+    inv = next(i for i in invs if i["id"] == min(i["id"] for i in mine))
+    if inv["status"] in ("queued", "running"):
+        return "running", inv
+    with urllib.request.urlopen(f"{LOKI_URL}/investigations/{inv['id']}/report", timeout=10) as r:
+        inv = {**inv, "report_text": r.read().decode()}
+    return "done", inv
+
+
+def judge(report, truth):
+    """Read the report's verdict line: *Root cause* (payment, deploy 6fbf7a2): ..."""
+    m = re.search(r"\*Root cause\* \(([^,)]+)(?:, deploy ([0-9a-f]+))?\)", report or "")
+    service, deploy = (m.group(1).strip(), m.group(2)) if m else (None, None)
+    conf = re.search(r"confidence (\d+)%", report or "")
+    return {"blamed_service": service, "blamed_deploy": deploy,
+            "right_service": service == truth["service"],
+            "right_deploy": deploy == truth["deploy_id"],
+            "confidence": int(conf.group(1)) / 100 if conf else None}
+
+
+def cmd_break(name, force=False, deploy_mode="fresh"):
+    if name not in FAILURES:
+        sys.exit(f"Unknown failure {name!r}. Run: python3 otel-demo/break.py list")
+    if deploy_mode not in DEPLOY_MODES:
+        sys.exit(f"Unknown deploy mode {deploy_mode!r}; use one of {', '.join(DEPLOY_MODES)}")
+    reason = not_recovered(FAILURES[name][0], force)
+    if reason:
+        sys.exit(f"{reason} Run reset if you haven't, wait a few minutes and try again, or add --force.")
+    truth = do_break(name, deploy_mode)
+    bad = truth["matching_deploy"]
+    print(f"Broke {truth['service']} ({name}). Deploy history: {deploy_mode}"
+          + (f", matching deploy {bad}" if bad else ", no matching deploy") + ".")
     print("Wait about 2-3 minutes for the alert, then: python3 otel-demo/break.py score")
 
 
@@ -196,35 +260,34 @@ def cmd_score():
     if not runs:
         sys.exit("Nothing broken yet.")
     truth = runs[-1]
-    started = datetime.fromisoformat(truth["started_at"])
+    truth.setdefault("deploy_mode", "fresh")
     try:
-        with urllib.request.urlopen(f"{LOKI_URL}/investigations", timeout=10) as r:
-            invs = json.load(r)
-        # The first live investigation opened after this break, not one left from an earlier run.
-        mine = [i for i in invs if i["mode"] == "live" and datetime.fromisoformat(i["created_at"]) >= started]
-        if not mine:
-            sys.exit("Loki hasn't opened an investigation since this break yet. Try again in a minute.")
-        inv_id = min(i["id"] for i in mine)
-        with urllib.request.urlopen(f"{LOKI_URL}/investigations/{inv_id}/report", timeout=10) as r:
-            report = r.read().decode()
+        state, inv = find_report(truth)
     except urllib.error.URLError as e:
         sys.exit(f"Couldn't read Loki's report from {LOKI_URL}: {e}")
-    if "is running" in report and len(report) < 200:
-        sys.exit(f"{report.strip()} Try again in a minute.")
-    # The report's verdict line: *Root cause* (payment, deploy 6fbf7a2): ...
-    m = re.search(r"\*Root cause\* \(([^,)]+)(?:, deploy ([0-9a-f]+))?\)", report)
-    blamed_service, blamed_deploy = (m.group(1).strip(), m.group(2)) if m else (None, None)
-    print(report)
+    if state == "waiting":
+        sys.exit("Loki hasn't opened an investigation since this break yet. Try again in a minute.")
+    if state == "running":
+        sys.exit(f"Investigation #{inv['id']} is running. Try again in a minute.")
+    v = judge(inv["report_text"], truth)
+    print(inv["report_text"])
     print("\n" + "-" * 60)
-    print(f"Truth: {truth['flag']} broke {truth['service']}, bad deploy {truth['deploy_id']}")
-    print(f"Loki blamed: {blamed_service or '(no root cause line)'}, deploy {blamed_deploy or '(none)'}")
-    print(f"Right service: {'yes' if blamed_service == truth['service'] else 'NO'}")
-    print(f"Right deploy:  {'yes' if blamed_deploy == truth['deploy_id'] else 'NO'}")
+    want = f"bad deploy {truth['deploy_id']}" if truth["deploy_id"] else "no deploy to blame"
+    print(f"Truth: {truth['flag']} broke {truth['service']}, {want} (deploy history: {truth['deploy_mode']})")
+    print(f"Loki blamed: {v['blamed_service'] or '(no root cause line)'}, deploy {v['blamed_deploy'] or '(none)'}")
+    print(f"Right service: {'yes' if v['right_service'] else 'NO'}")
+    print(f"Right deploy:  {'yes' if v['right_deploy'] else 'NO'}")
     print("(Read the report too: a right answer can still rest on wrong reasoning.)")
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--force"]
+    argv = sys.argv[1:]
+    mode = "fresh"
+    if "--deploy" in argv:
+        i = argv.index("--deploy")
+        mode = argv[i + 1] if i + 1 < len(argv) else ""
+        argv = argv[:i] + argv[i + 2:]
+    args = [a for a in argv if a != "--force"]
     if len(args) != 1:
         sys.exit(__doc__)
     arg = args[0]
@@ -236,7 +299,7 @@ def main():
     elif arg == "score":
         cmd_score()
     else:
-        cmd_break(arg, force="--force" in sys.argv)
+        cmd_break(arg, force="--force" in argv, deploy_mode=mode)
 
 
 if __name__ == "__main__":
