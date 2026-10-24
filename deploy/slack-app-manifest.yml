@@ -1,5 +1,11 @@
-# Slack app for one Loki pilot. api.slack.com/apps -> Create New App -> From a manifest.
-# Replace loki.customer.example.com with LOKI_DOMAIN. One app per customer workspace.
+# Loki's Slack app. api.slack.com/apps -> Create New App -> From a manifest.
+# Replace loki.example.com with LOKI_DOMAIN.
+#
+# One app serves every customer: they add it to their own workspace from Loki's setup
+# page ("Add to Slack"). For that, after creating it: Manage Distribution -> Activate
+# Public Distribution, then copy Client ID, Client Secret and Signing Secret
+# (Basic Information) into loki.env as SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET.
+# A single-customer setup can instead install it to one workspace and use SLACK_BOT_TOKEN.
 display_information:
   name: Loki
   description: AI incident investigator (read-only). Posts root-cause reports with confirm/reject buttons.
@@ -9,13 +15,16 @@ features:
     display_name: loki
     always_online: false
 oauth_config:
+  redirect_urls:
+    - https://loki.example.com/setup/slack/callback
   scopes:
     bot:
-      - chat:write          # post reports; the only scope Loki needs
+      - chat:write          # post reports
+      - incoming-webhook    # lets the customer pick the channel on Slack's own install screen
 settings:
   interactivity:
     is_enabled: true
-    request_url: https://loki.customer.example.com/slack/interactions
+    request_url: https://loki.example.com/slack/interactions
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false

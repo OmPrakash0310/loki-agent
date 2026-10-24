@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS tenants (
     active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- The one-page setup link a customer is sent (setup.py): hashed, expiring.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS setup_token_hash TEXT UNIQUE;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS setup_expires_at TIMESTAMPTZ;
 INSERT INTO tenants (id, slug, name) VALUES (1, 'default', 'Default') ON CONFLICT (id) DO NOTHING;
 SELECT setval(pg_get_serial_sequence('tenants', 'id'), GREATEST((SELECT max(id) FROM tenants), 1));
 

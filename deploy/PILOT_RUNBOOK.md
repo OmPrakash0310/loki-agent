@@ -237,6 +237,38 @@ into the customer's services or run its images on this server), and the demo dep
 buttons route by workspace (`SLACK_TEAM_ID`). If the database user can't create the restricted
 role `loki_app` (some managed Postgres plans), Loki runs as a single tenant and refuses `POST /tenants`.
 
+## 10c. One-page setup: customers connect Slack and GitHub themselves
+
+Instead of collecting tokens, send a customer a **setup link**. `POST /tenants` returns one
+(`setup_url`, valid 7 days); `POST /tenants/<id>/setup-link` makes a fresh one (the previous one
+stops working). On that page they:
+1. click **Add to Slack** and pick the channel on Slack's own screen;
+2. click **Install GitHub App**, pick repositories on GitHub's own screen, then confirm which
+   service each repository deploys;
+3. press **Show my webhook URLs** and paste one into their alerting tool;
+4. optionally paste Sentry, Datadog, Prometheus or Grafana Loki details.
+
+The page needs `LOKI_PUBLIC_URL`, `LOKI_SECRET_KEY`, and these one-time registrations.
+
+**Slack app (once):** create it from `deploy/slack-app-manifest.yml` with your domain filled in,
+then *Manage Distribution -> Activate Public Distribution*. From *Basic Information* copy the
+Client ID, Client Secret and Signing Secret into `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` and
+`SLACK_SIGNING_SECRET`.
+
+**GitHub App (once):** github.com/settings/apps/new (or your organization's settings):
+- Name: e.g. "Loki on-call" (its URL name becomes `GITHUB_APP_SLUG`). Homepage: your site.
+- *Setup URL*: `https://<domain>/setup/github/callback`, and tick *Redirect on update*.
+- *Webhook*: untick *Active*. Loki doesn't need GitHub's events.
+- *Repository permissions*, all **Read-only**: Contents, Deployments, Metadata, Pull requests.
+- *Where can this app be installed*: Any account.
+- After creating it: note the *App ID* (`GITHUB_APP_ID`) and *Generate a private key*. Put the
+  `.pem` in `GITHUB_APP_PRIVATE_KEY` (one line, newlines as `\n`) or mount it and set `GITHUB_APP_PRIVATE_KEY_FILE`.
+
+Loki then reads each customer's repos with a 1-hour installation token it renews itself;
+customers revoke access by uninstalling the app in GitHub. The setup link is a credential for
+that page only: it opens nothing else, and the page sends no referrer, so the link never reaches
+Slack or GitHub.
+
 ## 11. Offboarding and data deletion
 
 1. Ask the customer to remove the webhooks and uninstall the Slack app, and to revoke the GitHub token,
