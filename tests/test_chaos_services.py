@@ -178,10 +178,16 @@ def test_shop_faults(shop):
         r = c.post("/orders")
         codes[r.status_code] = codes.get(r.status_code, 0) + 1
     assert codes.get(500) and codes.get(200)  # partial: only Headphones fails
+    # Relative to the same request without the fault: a fixed threshold failed on a fast CI
+    # runner (200k rounds took 0.048s there).
+    set_faults(c, {})
+    t = time.perf_counter()
+    c.get("/products")
+    normal = time.perf_counter() - t
     set_faults(c, {"cpu_burn": {"rounds": 200_000}})
     t = time.perf_counter()
     c.get("/products")
-    assert time.perf_counter() - t > 0.05
+    assert time.perf_counter() - t > max(5 * normal, 0.01)
 
 
 def test_log_flood_and_flapping(shop, caplog):
