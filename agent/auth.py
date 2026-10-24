@@ -29,6 +29,7 @@ WEBHOOK_PREFIX = "/alerts"
 # (see share.py); a bad or expired signature is a 403 here, before any route runs.
 SHARE_METHODS = {"GET", "HEAD"}
 READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+SETUP_CALLBACKS = {"/setup/slack/callback", "/setup/github/callback"}
 SCOPES = {"read", "write"}
 
 
@@ -123,6 +124,15 @@ def identify(request: Request) -> Identity:
     path = request.url.path
     if path in PUBLIC_PATHS:
         return Identity(default, "anonymous")
+    if path.startswith("/setup/"):
+        # The one-page setup (setup.py). Slack and GitHub come back to the callbacks with an
+        # encrypted state the route checks; every other /setup/<token> path is that token's tenant.
+        if path in SETUP_CALLBACKS:
+            return Identity(default, "anonymous", frozenset({"read"}))
+        owner = _lookup(lambda t: t.by_setup_token, path.split("/")[2])
+        if owner is None:
+            raise HTTPException(404, "setup link not found or expired")
+        return Identity(owner, f"setup:{owner.slug}")
     import share  # share imports auth
     m = share.PATH_RE.fullmatch(path)
     if m and request.method in SHARE_METHODS:
@@ -181,14 +191,18 @@ def require_auth(request: Request):
     request.state.actor = found.actor
 
 
-_TOKEN_RE = re.compile(r"((?:token|sig)=)[^&\s\"]+", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"((?:token|sig|state|code)=)[^&\s\"]+|(/setup/)lks_[\w-]+", re.IGNORECASE)
+
+
+def _mask(text: str) -> str:
+    return _TOKEN_RE.sub(lambda m: (m.group(1) or m.group(2)) + "***", text)
 
 
 def _redact_arg(a):
     if isinstance(a, (int, float)) or a is None:
         return a
     text = a if isinstance(a, str) else str(a)  # e.g. an httpx URL object
-    return _TOKEN_RE.sub(r"\1***", text) if _TOKEN_RE.search(text) else a
+    return _mask(text) if _TOKEN_RE.search(text) else a
 
 
 class RedactTokenFilter(logging.Filter):
@@ -198,7 +212,7 @@ class RedactTokenFilter(logging.Filter):
         if record.args:
             record.args = tuple(_redact_arg(a) for a in record.args)
         if isinstance(record.msg, str):
-            record.msg = _TOKEN_RE.sub(r"\1***", record.msg)
+            record.msg = _mask(record.msg)
         return True
 
 

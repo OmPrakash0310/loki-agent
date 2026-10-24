@@ -57,6 +57,27 @@ def by_api_key(key: str) -> tenant.Tenant | None:
     return get(row["id"]) if row else None
 
 
+SETUP_DAYS = 7
+
+
+def new_setup_link(tenant_id: int, days: int = SETUP_DAYS) -> str:
+    """A fresh setup token for a tenant (the old one stops working). Returns the token."""
+    if tenant_id == tenant.DEFAULT_ID:
+        raise ValueError("the default tenant is configured with environment variables, not a setup page")
+    token = tenant.new_token("lks")
+    with db.connect(admin=True) as conn:
+        n = conn.execute("UPDATE tenants SET setup_token_hash = %s, setup_expires_at = now() + make_interval(days => %s) "
+                         "WHERE id = %s", (tenant.token_hash(token), days, tenant_id)).rowcount
+    if not n:
+        raise ValueError(f"no tenant {tenant_id}")
+    return token
+
+
+def by_setup_token(token: str) -> tenant.Tenant | None:
+    row = _row("setup_token_hash = %s AND setup_expires_at > now()", (tenant.token_hash(token),)) if token else None
+    return get(row["id"]) if row else None
+
+
 def by_slug(slug: str) -> tenant.Tenant | None:
     if slug == tenant.DEFAULT.slug:
         return tenant.DEFAULT

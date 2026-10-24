@@ -52,9 +52,16 @@ class GitHubDeploys(DeploysSource):
     @classmethod
     def from_env(cls):
         token = tenant.setting("GITHUB_TOKEN", "")
+        installation = tenant.setting("GITHUB_INSTALLATION_ID", "")
         repos = parse_mapping(tenant.setting("GITHUB_REPOS", ""))
-        if not token or not repos:
-            raise ValueError("LOKI_DEPLOYS_SOURCE=github needs GITHUB_TOKEN and GITHUB_REPOS")
+        if not (token or installation) or not repos:
+            raise ValueError("LOKI_DEPLOYS_SOURCE=github needs GITHUB_REPOS and a GitHub App installation "
+                             "(GITHUB_INSTALLATION_ID) or GITHUB_TOKEN")
+        if installation and not token:
+            # Installed from the setup page: short-lived installation tokens, nothing pasted.
+            import githubapp
+            return cls(repos, githubapp.client(int(installation)), tenant.setting("GITHUB_ENVIRONMENT", ""),
+                       float(tenant.setting("GITHUB_LOOKBACK_HOURS") or 24))
         client = httpx.Client(
             base_url=tenant.setting("GITHUB_API_URL") or "https://api.github.com",  # compose passes ""
             headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",

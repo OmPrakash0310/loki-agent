@@ -3,6 +3,7 @@ investigation per alert storm and runs the investigator in the background.
 """
 import json
 import logging
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ import auth
 import backtest
 import db
 import selfmon
+import setup
 import intake
 import investigator
 import lessons
@@ -92,6 +94,7 @@ async def lifespan(_app):
 
 
 app = FastAPI(dependencies=[Depends(auth.require_auth)], lifespan=lifespan)
+app.include_router(setup.router)
 auth.install_log_filter()
 
 
@@ -625,7 +628,27 @@ def create_tenant(body: NewTenant, request: Request):
     with db.connect() as conn:
         conn.execute("INSERT INTO audit_log (actor, action) VALUES (%s, %s)",
                      (request.state.actor, f"tenant.create:{created['slug']}"))
+    created["setup_url"] = _setup_url(tenants.new_setup_link(created["id"]), request)
     return created
+
+
+def _setup_url(token: str, request: Request) -> str:
+    base = os.environ.get("LOKI_PUBLIC_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
+    return f"{base}/setup/{token}"
+
+
+@app.post("/tenants/{tenant_id}/setup-link")
+def new_setup_link(tenant_id: int, request: Request):
+    """A new one-page setup link to send the customer (valid 7 days; the previous one stops working)."""
+    _operator(request)
+    try:
+        token = tenants.new_setup_link(tenant_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    with db.connect() as conn:
+        conn.execute("INSERT INTO audit_log (actor, action) VALUES (%s, %s)",
+                     (request.state.actor, f"tenant.setup_link:{tenant_id}"))
+    return {"id": tenant_id, "setup_url": _setup_url(token, request), "valid_days": tenants.SETUP_DAYS}
 
 
 @app.get("/tenants")
