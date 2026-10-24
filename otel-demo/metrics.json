@@ -1,0 +1,13 @@
+{
+  "preset": "otel",
+  "service_label": "service_name",
+  "status_label": "status_code",
+  "status_5xx": "STATUS_CODE_ERROR",
+  "requests": "traces_span_metrics_calls_total",
+  "latency_histogram": "traces_span_metrics_duration_milliseconds",
+  "dependency_histogram": null,
+  "log_service_label": "service_name",
+  "services_from_requests": true,
+  "rate_window": "5m",
+  "latency_scale": 0.001
+}

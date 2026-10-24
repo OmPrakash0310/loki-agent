@@ -1,0 +1,38 @@
+# Alerts on the demo's span metrics. The demo's traffic is low (a few calls a minute per
+# service), so rates use a 5m window. Errors are counted on every span kind: the
+# demo's failures are often recorded on internal spans, not server spans.
+groups:
+  - name: otel-demo
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (service_name) (rate(traces_span_metrics_calls_total{status_code="STATUS_CODE_ERROR"}[5m]))
+            / sum by (service_name) (rate(traces_span_metrics_calls_total[5m])) > 0.05
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.service_name }} error rate is {{ $value | humanizePercentage }}"
+      - alert: HighLatency
+        # Span durations are in milliseconds. flagd holds streaming connections open for
+        # minutes by design, so its "latency" is always huge: leave it out.
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, service_name) (rate(traces_span_metrics_duration_milliseconds_bucket{span_kind="SPAN_KIND_SERVER",service_name!="flagd"}[5m]))) > 1000
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service_name }} p95 latency is {{ $value | humanize }}ms"
+      - alert: HighCpu
+        # Percent of one core, per container (docker_stats). Only the store's own services:
+        # the demo's infrastructure (collector, OpenSearch, Prometheus, load generator...) and
+        # this lab's containers are left out. Both label names are set: Loki reads `service`
+        # from Alertmanager, the other rules use `service_name`.
+        expr: |
+          label_replace(label_replace(
+            max by (container_name) (container_cpu_utilization_ratio{container_name!~"otel-collector|opensearch|prometheus|grafana|jaeger|load-generator|flagd.*|otel-demo-.*|kafka"}),
+            "service_name", "$1", "container_name", "(.*)"),
+            "service", "$1", "container_name", "(.*)") > 80
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.service_name }} CPU is {{ $value | humanize }}% of a core"

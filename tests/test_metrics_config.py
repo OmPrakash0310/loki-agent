@@ -194,6 +194,24 @@ def test_label_values_are_escaped():
     assert cfg.promql("request_rate", 'a"b') == 'sum(rate(http_requests_total{service="a\\"b"}[1m]))'
 
 
+def test_rate_window_widens_every_range():
+    cfg = metrics_config.MetricsConfig(rate_window="5m")
+    queries = [cfg.promql(m, "ad") for m in metrics_config.METRIC_NAMES] + [cfg.dependency_promql("ad")]
+    assert all("[5m]" in q and "[1m]" not in q for q in queries)
+    with pytest.raises(ValueError, match="rate_window"):
+        metrics_config.MetricsConfig(rate_window="5 min")
+
+
+def test_latency_scale_converts_milliseconds_to_seconds():
+    cfg = metrics_config.MetricsConfig(latency_scale=0.001)
+    assert cfg.promql("p95_latency_seconds", "ad").endswith(") * 0.001")
+    assert cfg.dependency_promql("ad").endswith(") * 0.001")
+    assert "* " not in cfg.promql("error_rate", "ad")
+    assert "* " not in metrics_config.MetricsConfig().promql("p95_latency_seconds", "ad")
+    with pytest.raises(ValueError, match="latency_scale"):
+        metrics_config.MetricsConfig(latency_scale=0)
+
+
 def test_custom_log_label_is_used_for_the_query_and_the_stream(monkeypatch):
     monkeypatch.setenv("LOKI_METRICS_PRESET", "otel")
     seen = []
