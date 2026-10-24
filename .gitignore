@@ -8,3 +8,5 @@ evals/results/
 # OTel Demo lab: generated per run
 otel-demo/state/
 otel-demo/runs.jsonl
+otel-demo/eval-results.jsonl
+otel-demo/eval-results.md

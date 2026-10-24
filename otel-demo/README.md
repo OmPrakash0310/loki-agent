@@ -44,6 +44,28 @@ OTel Demo ──span metrics──► demo Prometheus ──► loki-prometheus 
    ```
 8. **Destroy the droplet** when you're finished.
 
+## Run the whole eval unattended
+
+`eval.py` does steps 5 to 7 for many failures in a row: it waits until the store has
+recovered, breaks it, waits for Loki's report, scores it and resets, then prints an
+accuracy table (also saved to `otel-demo/eval-results.md`).
+
+```bash
+tmux new -s eval
+python3 otel-demo/eval.py                 # 6 failures x 3 deploy histories, once each (about 4-5 hours)
+```
+
+Reattach after a disconnect with `tmux attach -t eval`. If it stops, run it again with
+`--resume` to skip what's done. `--failures a,b`, `--modes fresh,none` and `--runs 2` narrow
+or repeat it; `--table` only prints the table.
+
+Each failure is tried with three deploy histories (`break.py --deploy` does the same by hand):
+- **fresh:** the matching bad deploy went out a minute before.
+- **none:** no matching deploy, only innocent ones. Loki must name the service and blame no deploy.
+- **old:** the matching deploy went out hours ago. Blaming it is wrong.
+
+It costs the Claude usage of one investigation per run (a few cents each).
+
 ## Known gaps
 
 - Latency comes from span metrics in **milliseconds**, but Loki labels p95 as seconds.
