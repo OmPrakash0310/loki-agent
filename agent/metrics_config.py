@@ -240,9 +240,9 @@ def _read_file(path: str) -> dict:
     return data
 
 
-def load(preset: str | None = None, path: str | None = None) -> MetricsConfig:
-    """Build a config from a preset plus optional file overrides."""
-    data = _read_file(path) if path else {}
+def load(preset: str | None = None, path: str | None = None, data: dict | None = None) -> MetricsConfig:
+    """Build a config from a preset plus optional overrides, from a file or a dict."""
+    data = dict(data) if data is not None else (_read_file(path) if path else {})
     name = (data.pop("preset", None) or preset or "default").strip().lower()
     if name not in PRESETS:
         raise ValueError(f"unknown metrics preset {name!r}; use one of {', '.join(PRESETS)}")
@@ -254,7 +254,19 @@ def load(preset: str | None = None, path: str | None = None) -> MetricsConfig:
 
 
 def current() -> MetricsConfig:
-    """The active config, from LOKI_METRICS_PRESET and LOKI_METRICS_CONFIG (re-read when they change)."""
+    """The active config, from LOKI_METRICS_PRESET and LOKI_METRICS_CONFIG (re-read when they change).
+    Other tenants keep theirs in their settings: LOKI_METRICS_PRESET and LOKI_METRICS_CONFIG_JSON."""
+    import tenant
+    if not tenant.current().is_default:
+        preset = (tenant.setting("LOKI_METRICS_PRESET") or "").strip() or None
+        raw = tenant.setting("LOKI_METRICS_CONFIG_JSON") or ""
+        key = (tenant.current_id(), preset, raw)
+        if key not in _cache:
+            data = json.loads(raw) if raw else {}
+            if not isinstance(data, dict):
+                raise ValueError("LOKI_METRICS_CONFIG_JSON must hold an object of settings")
+            _cache[key] = load(preset, data=data)
+        return _cache[key]
     preset = os.environ.get("LOKI_METRICS_PRESET", "").strip() or None
     path = os.environ.get("LOKI_METRICS_CONFIG", "").strip() or None
     key = (preset, path, os.path.getmtime(path) if path else None)

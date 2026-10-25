@@ -3,6 +3,7 @@ investigation per alert storm and runs the investigator in the background.
 """
 import json
 import logging
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from datetime import datetime
 from urllib.parse import parse_qs
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
@@ -17,11 +19,14 @@ import auth
 import backtest
 import db
 import selfmon
+import setup
 import intake
 import investigator
 import lessons
 import share
 import slack
+import tenant
+import tenants
 import tools
 from redact import redact
 
@@ -48,30 +53,35 @@ def startup():
     db.init()
     # Investigations run in background threads; a restart kills them. Don't leave them hanging.
     requeued = []
-    with db.connect() as conn:
-        # A restart (deploy, crash, reboot) kills the background threads. A live investigation that
-        # started recently is run again from scratch (its partial trace is dropped) instead of being
-        # lost; older ones, backtests, and ones already restarted once are marked failed.
+    failed = []
+    # A restart (deploy, crash, reboot) kills the background threads. A live investigation that
+    # started recently is run again from scratch (its partial trace is dropped) instead of being
+    # lost; older ones, backtests, and ones already restarted once are marked failed. Every
+    # tenant's: found with an admin connection, then handled as that tenant.
+    with db.connect(admin=True) as conn:
         orphans = conn.execute(
-            "SELECT id, mode, (created_at > now() - make_interval(secs => %s)) AS recent, restarts "
+            "SELECT id, tenant_id, mode, (created_at > now() - make_interval(secs => %s)) AS recent, restarts "
             "FROM investigations WHERE status IN ('queued', 'running')", (RESUME_WINDOW_S,),
         ).fetchall()
-        failed = []
-        for o in orphans:
+    for o in orphans:
+        owner = tenants.get(o["tenant_id"]) or tenant.Tenant(o["tenant_id"], "?", "?")
+        with tenant.use(owner), db.connect() as conn:
             if o["mode"] == "live" and o["recent"] and o["restarts"] < 1:
                 conn.execute("DELETE FROM trace_steps WHERE investigation_id = %s", (o["id"],))
                 conn.execute("UPDATE investigations SET status = 'queued', restarts = restarts + 1 WHERE id = %s", (o["id"],))
-                requeued.append(o["id"])
+                requeued.append((owner, o["id"]))
             else:
                 conn.execute(
                     "UPDATE investigations SET status = 'failed', finished_at = now(), "
                     "error = 'agent restarted mid-investigation' WHERE id = %s", (o["id"],))
                 failed.append(o["id"])
     selfmon.start()
-    for inv_id in requeued:
-        _start_investigation(inv_id)
+    for owner, inv_id in requeued:
+        with tenant.use(owner):
+            _start_investigation(inv_id)
     if requeued:
-        log.warning("re-queued %d investigation(s) interrupted by a restart: %s", len(requeued), requeued)
+        log.warning("re-queued %d investigation(s) interrupted by a restart: %s",
+                    len(requeued), [i for _, i in requeued])
     if failed:
         log.warning("marked %d orphaned investigation(s) as failed: %s", len(failed), failed)
 
@@ -84,7 +94,22 @@ async def lifespan(_app):
 
 
 app = FastAPI(dependencies=[Depends(auth.require_auth)], lifespan=lifespan)
+app.include_router(setup.router)
 auth.install_log_filter()
+
+
+@app.middleware("http")
+async def tenant_context(request: Request, call_next):
+    """Work out who is calling and for which tenant, before anything else runs, and run
+    the request as that tenant (db.connect, settings, caches all follow it). A bad
+    credential is kept and raised by auth.require_auth, so error responses stay the same."""
+    try:
+        identity = await run_in_threadpool(auth.identify, request)
+    except HTTPException as e:
+        identity = e
+    request.state.identity = identity
+    with tenant.use(tenant.DEFAULT if isinstance(identity, HTTPException) else identity.tenant):
+        return await call_next(request)
 
 
 def _attach_to_investigation(conn, incident_id: int) -> tuple[int, bool]:
@@ -116,7 +141,13 @@ def _run_after_grouping(inv_id: int):
 
 
 def _start_investigation(inv_id: int):
-    threading.Thread(target=_run_after_grouping, args=(inv_id,), daemon=True).start()
+    # A new thread doesn't inherit the request's tenant: hand it over explicitly.
+    owner = tenant.current()
+
+    def run():
+        with tenant.use(owner):
+            _run_after_grouping(inv_id)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _ingest(parse, payload) -> dict:
@@ -351,7 +382,7 @@ def _confirm(inv_id: int, who: str | None = None, user_id: str | None = None, ac
         conn.execute(
             "INSERT INTO report_cache (exact_key, fingerprint, investigation_id, report, confirmed, expires_at) "
             "VALUES (%s, %s, %s, %s, true, now() + make_interval(days => %s)) "
-            "ON CONFLICT (exact_key) DO UPDATE SET investigation_id = EXCLUDED.investigation_id, "
+            "ON CONFLICT (tenant_id, exact_key) DO UPDATE SET investigation_id = EXCLUDED.investigation_id, "
             "report = EXCLUDED.report, confirmed = true, created_at = now(), expires_at = EXCLUDED.expires_at",
             (inv["cache_key"], inv["fingerprint"], inv_id, json.dumps(inv["report"]), investigator.CACHE_TTL_DAYS),
         )
@@ -404,7 +435,14 @@ async def slack_interactions(request: Request, background: BackgroundTasks):
                                   request.headers.get("X-Slack-Signature", "")):
         raise HTTPException(401, "bad slack signature")
     payload = json.loads(parse_qs(body.decode()).get("payload", ["{}"])[0])
-    background.add_task(slack.handle_interaction, payload, _confirm, _reject)
+    # Which customer's workspace clicked: the tenant that installed Loki there, else default.
+    team = (payload.get("team") or {}).get("id", "")
+    owner = await run_in_threadpool(tenants.by_slack_team, team) if team else None
+
+    def handle():
+        with tenant.use(owner or tenant.DEFAULT):
+            slack.handle_interaction(payload, _confirm, _reject)
+    background.add_task(handle)
     return Response(status_code=200)
 
 
@@ -561,3 +599,91 @@ def approve_lesson(lesson_id: int, request: Request):
 @app.post("/lessons/{lesson_id}/disable")
 def disable_lesson(lesson_id: int, request: Request):
     return _set_lesson(lesson_id, False, request.state.actor, "lesson_disable")
+
+
+# ---------- tenants (operator only) ----------
+
+def _operator(request: Request):
+    identity = request.state.identity
+    if not getattr(identity, "operator", False):
+        raise HTTPException(403, "only a server API key (LOKI_API_KEYS) can manage tenants")
+    return identity
+
+
+class NewTenant(BaseModel):
+    slug: str
+    name: str
+
+
+@app.post("/tenants")
+def create_tenant(body: NewTenant, request: Request):
+    """A new customer. The webhook token and API key are shown once: store them now."""
+    _operator(request)
+    try:
+        created = tenants.create(body.slug, body.name)
+    except tenants.TenancyUnavailable as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    with db.connect() as conn:
+        conn.execute("INSERT INTO audit_log (actor, action) VALUES (%s, %s)",
+                     (request.state.actor, f"tenant.create:{created['slug']}"))
+    created["setup_url"] = _setup_url(tenants.new_setup_link(created["id"]), request)
+    return created
+
+
+def _setup_url(token: str, request: Request) -> str:
+    base = os.environ.get("LOKI_PUBLIC_URL", "").rstrip("/") or str(request.base_url).rstrip("/")
+    return f"{base}/setup/{token}"
+
+
+@app.post("/tenants/{tenant_id}/setup-link")
+def new_setup_link(tenant_id: int, request: Request):
+    """A new one-page setup link to send the customer (valid 7 days; the previous one stops working)."""
+    _operator(request)
+    try:
+        token = tenants.new_setup_link(tenant_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    with db.connect() as conn:
+        conn.execute("INSERT INTO audit_log (actor, action) VALUES (%s, %s)",
+                     (request.state.actor, f"tenant.setup_link:{tenant_id}"))
+    return {"id": tenant_id, "setup_url": _setup_url(token, request), "valid_days": tenants.SETUP_DAYS}
+
+
+@app.get("/tenants")
+def list_tenants(request: Request):
+    """Tenants and which settings each has (names only, never values)."""
+    _operator(request)
+    return tenants.listing()
+
+
+@app.put("/tenants/{tenant_id}/settings")
+def set_tenant_settings(tenant_id: int, request: Request, values: dict = Body(...)):
+    """Merge settings (see tenant.PER_TENANT); secrets are encrypted at rest. "" removes one."""
+    _operator(request)
+    try:
+        names = tenants.update_settings(tenant_id, values)
+    except tenant.SecretKeyMissing as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    with db.connect() as conn:
+        conn.execute("INSERT INTO audit_log (actor, action) VALUES (%s, %s)",
+                     (request.state.actor, f"tenant.settings:{tenant_id}:{','.join(sorted(values))}"))
+    return {"id": tenant_id, "settings": names}
+
+
+@app.post("/tenants/{tenant_id}/rotate/{what}")
+def rotate_tenant_credential(tenant_id: int, what: str, request: Request):
+    """A new webhook_token or api_key for a tenant; the old one stops working at once."""
+    _operator(request)
+    if what not in ("webhook_token", "api_key"):
+        raise HTTPException(400, "rotate webhook_token or api_key")
+    if tenant_id == tenant.DEFAULT_ID:
+        raise HTTPException(400, "the default tenant's credentials are LOKI_WEBHOOK_TOKEN and LOKI_API_KEYS")
+    value = tenants.rotate(tenant_id, what)
+    with db.connect() as conn:
+        conn.execute("INSERT INTO audit_log (actor, action) VALUES (%s, %s)",
+                     (request.state.actor, f"tenant.rotate:{tenant_id}:{what}"))
+    return {"id": tenant_id, what: value}

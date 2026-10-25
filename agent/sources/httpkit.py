@@ -5,6 +5,8 @@ import time
 
 import httpx
 
+import tenant
+
 
 class RateLimited(Exception):
     def __init__(self, retry_after_s: int | None):
@@ -57,17 +59,16 @@ def auth_headers(kind: str) -> dict:
     """Credentials for the customer's Prometheus (kind "PROM") or Grafana Loki (kind "LOGS"), from env vars named LOKI_<kind>_...
     Read at call time. BEARER_TOKEN, or BASIC_USER + BASIC_PASSWORD (Grafana Cloud), and
     ORG_ID for multi-tenant Mimir/Loki (X-Scope-OrgID). Empty when none are set."""
-    env = os.environ
     prefix = f"LOKI_{kind}"
     h = {}
-    token = env.get(f"{prefix}_BEARER_TOKEN", "").strip()
-    user = env.get(f"{prefix}_BASIC_USER", "").strip()
+    token = tenant.setting(f"{prefix}_BEARER_TOKEN", "").strip()
+    user = tenant.setting(f"{prefix}_BASIC_USER", "").strip()
     if token:
         h["Authorization"] = f"Bearer {token}"
     elif user:
-        cred = base64.b64encode(f"{user}:{env.get(f'{prefix}_BASIC_PASSWORD', '')}".encode()).decode()
+        cred = base64.b64encode(f"{user}:{tenant.setting(f'{prefix}_BASIC_PASSWORD', '')}".encode()).decode()
         h["Authorization"] = f"Basic {cred}"
-    org = env.get(f"{prefix}_ORG_ID", "").strip()
+    org = tenant.setting(f"{prefix}_ORG_ID", "").strip()
     if org:
         h["X-Scope-OrgID"] = org
     return h

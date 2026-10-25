@@ -199,6 +199,76 @@ for `/health/ready`. It then checks that all 7 tables exist. The schema migrates
 sets `LOKI_VERSION` back and restarts the old image. Because migrations only add, the old image
 runs on the newer schema. If even the rollback fails, restore the backup the upgrade just made.
 
+## 10b. Several customers on one server
+
+One Loki can serve several customers (tenants). `loki.env` configures the first one, the
+**default tenant**, exactly as above. Each other customer gets its own webhook token, API key,
+integrations and budget, and Postgres keeps their data apart with row-level security: a
+connection acting for one customer can't read or write another's rows.
+
+`install.sh` generates `LOKI_SECRET_KEY`, which encrypts customers' secrets in the database.
+**Back it up with `loki.env`**: without it, stored customer secrets can't be read.
+
+Add a customer (with a server key from `LOKI_API_KEYS`):
+```bash
+ADMIN=<admin key>
+curl -s -X POST https://<domain>/tenants -H "Authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' -d '{"slug": "acme", "name": "Acme Inc"}'
+```
+The answer holds its `webhook_token` and `api_key`, **shown once**. Store them now. Its alert
+webhooks are the URLs from `loki urls` with `?token=<its webhook_token>`.
+
+Configure it (names as in `.env.template`; `""` removes one; secrets are encrypted):
+```bash
+curl -s -X PUT https://<domain>/tenants/2/settings -H "Authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' \
+  -d '{"SLACK_BOT_TOKEN": "xoxb-...", "SLACK_CHANNEL": "C0...", "SLACK_TEAM_ID": "T0...",
+       "LOKI_DEPLOYS_SOURCE": "github", "GITHUB_TOKEN": "github_pat_...", "GITHUB_REPOS": "acme/shop=shop",
+       "LOKI_ERRORS_SOURCE": "sentry", "SENTRY_TOKEN": "...", "SENTRY_ORG": "acme", "SENTRY_PROJECTS": "shop=shop",
+       "LOKI_DAILY_BUDGET_USD": "3"}'
+```
+- `GET /tenants` lists customers and the *names* of their settings, never values.
+- `POST /tenants/<id>/rotate/webhook_token` or `/rotate/api_key` replaces a credential at once.
+- A server key can act for a customer with the header `X-Loki-Tenant: acme` (reading its reports, for example).
+- `LOKI_TOTAL_DAILY_BUDGET_USD` caps the Claude spend of all customers together; each also has `LOKI_DAILY_BUDGET_USD`.
+
+What stays with the default tenant only: live probes and verification by reproduction (they reach
+into the customer's services or run its images on this server), and the demo deploy file. Slack's
+buttons route by workspace (`SLACK_TEAM_ID`). If the database user can't create the restricted
+role `loki_app` (some managed Postgres plans), Loki runs as a single tenant and refuses `POST /tenants`.
+
+## 10c. One-page setup: customers connect Slack and GitHub themselves
+
+Instead of collecting tokens, send a customer a **setup link**. `POST /tenants` returns one
+(`setup_url`, valid 7 days); `POST /tenants/<id>/setup-link` makes a fresh one (the previous one
+stops working). On that page they:
+1. click **Add to Slack** and pick the channel on Slack's own screen;
+2. click **Install GitHub App**, pick repositories on GitHub's own screen, then confirm which
+   service each repository deploys;
+3. press **Show my webhook URLs** and paste one into their alerting tool;
+4. optionally paste Sentry, Datadog, Prometheus or Grafana Loki details.
+
+The page needs `LOKI_PUBLIC_URL`, `LOKI_SECRET_KEY`, and these one-time registrations.
+
+**Slack app (once):** create it from `deploy/slack-app-manifest.yml` with your domain filled in,
+then *Manage Distribution -> Activate Public Distribution*. From *Basic Information* copy the
+Client ID, Client Secret and Signing Secret into `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` and
+`SLACK_SIGNING_SECRET`.
+
+**GitHub App (once):** github.com/settings/apps/new (or your organization's settings):
+- Name: e.g. "Loki on-call" (its URL name becomes `GITHUB_APP_SLUG`). Homepage: your site.
+- *Setup URL*: `https://<domain>/setup/github/callback`, and tick *Redirect on update*.
+- *Webhook*: untick *Active*. Loki doesn't need GitHub's events.
+- *Repository permissions*, all **Read-only**: Contents, Deployments, Metadata, Pull requests.
+- *Where can this app be installed*: Any account.
+- After creating it: note the *App ID* (`GITHUB_APP_ID`) and *Generate a private key*. Put the
+  `.pem` in `GITHUB_APP_PRIVATE_KEY` (one line, newlines as `\n`) or mount it and set `GITHUB_APP_PRIVATE_KEY_FILE`.
+
+Loki then reads each customer's repos with a 1-hour installation token it renews itself;
+customers revoke access by uninstalling the app in GitHub. The setup link is a credential for
+that page only: it opens nothing else, and the page sends no referrer, so the link never reaches
+Slack or GitHub.
+
 ## 11. Offboarding and data deletion
 
 1. Ask the customer to remove the webhooks and uninstall the Slack app, and to revoke the GitHub token,
@@ -235,7 +305,7 @@ request bodies at 1 MB and sets HSTS, CSP, nosniff, frame-deny and no-referrer h
 
 ## 13. Known limits
 
-- **One instance per customer.** There is no multi-tenancy and no HA. A VPS outage means missed alerts until it is back.
+- **No HA.** One server, possibly for several customers (section 10b). A VPS outage means missed alerts until it is back.
   Alertmanager retries, but most SaaS webhooks do not.
 - Datadog metrics and PagerDuty are intake only. Datadog logs are read through the Logs Search API (untested live).
 - Investigations run in-process. After a restart, live ones started in the last 30 minutes are run again

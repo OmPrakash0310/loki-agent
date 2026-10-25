@@ -116,6 +116,8 @@ fi
 [[ -n "$(env_get LOKI_API_KEYS)" ]] || env_set LOKI_API_KEYS "admin:$(rand_hex 32),mcp:$(rand_hex 32):read"
 [[ -n "$(env_get LOKI_WEBHOOK_TOKEN)" ]] || env_set LOKI_WEBHOOK_TOKEN "$(rand_hex 32)"
 [[ -n "$(env_get LOKI_LINK_SECRET)" ]] || env_set LOKI_LINK_SECRET "$(rand_hex 32)"
+# Fernet key (32 random bytes, url-safe base64): encrypts other customers' secrets in the database.
+[[ -n "$(env_get LOKI_SECRET_KEY)" ]] || env_set LOKI_SECRET_KEY "$(openssl rand -base64 32 | tr '+/' '-_')"
 [[ -n "$(env_get LOKI_PROBE_TOKEN)" ]] || env_set LOKI_PROBE_TOKEN "$(rand_hex 32)"
 
 # ---- 4. CLI + cron ----

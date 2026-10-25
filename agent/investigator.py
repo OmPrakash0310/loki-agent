@@ -26,6 +26,7 @@ import db
 import lessons
 import slack
 import telemetry as tm
+import tenant
 import tools
 import verifier
 
@@ -180,6 +181,26 @@ def _trace(conn, inv_id: int, step: int, tool: str, args, output: str, model=Non
     )
 
 
+# All tenants together, paid by the operator. Unset: no cap across tenants.
+TOTAL_DAILY_BUDGET_USD = float(os.environ.get("LOKI_TOTAL_DAILY_BUDGET_USD", "0") or 0)
+
+
+def _max_cost() -> float:
+    """Per-investigation cap: the tenant's own, else the server's."""
+    return MAX_COST_USD if tenant.current().is_default else float(tenant.setting("LOKI_MAX_COST_USD") or MAX_COST_USD)
+
+
+def _daily_budget() -> float:
+    return DAILY_BUDGET_USD if tenant.current().is_default else float(tenant.setting("LOKI_DAILY_BUDGET_USD") or DAILY_BUDGET_USD)
+
+
+def _spent_today_all_tenants() -> float:
+    with db.connect(admin=True) as conn:
+        row = conn.execute("SELECT coalesce(sum(cost_usd), 0) AS spent FROM investigations "
+                           "WHERE created_at >= date_trunc('day', now())").fetchone()
+    return float(row["spent"])
+
+
 def _spent_today(conn) -> float:
     row = conn.execute(
         "SELECT coalesce(sum(cost_usd), 0) AS spent FROM investigations WHERE created_at >= date_trunc('day', now())"
@@ -283,12 +304,17 @@ def investigate(inv_id: int, model: str | None = None) -> None:
 
 def _investigate(inv_id: int, model: str, backtest: bool) -> None:
     with db.connect() as conn:
-        if _spent_today(conn) >= DAILY_BUDGET_USD:
+        over = None
+        if _spent_today(conn) >= _daily_budget():
+            over = f"daily budget of ${_daily_budget():.2f} reached"
+        elif TOTAL_DAILY_BUDGET_USD and _spent_today_all_tenants() >= TOTAL_DAILY_BUDGET_USD:
+            over = "the server's daily budget across all customers is reached"
+        if over:
             conn.execute(
                 "UPDATE investigations SET status = 'skipped', finished_at = now(), error = %s WHERE id = %s",
-                (f"daily budget of ${DAILY_BUDGET_USD:.2f} reached", inv_id),
+                (over, inv_id),
             )
-            log.warning("investigation #%s skipped: daily budget reached", inv_id)
+            log.warning("investigation #%s skipped: %s", inv_id, over)
             return
 
         conn.execute("UPDATE investigations SET status = 'running', model = %s WHERE id = %s", (model, inv_id))
@@ -383,14 +409,14 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
         client = (anthropic.Anthropic(api_key="ollama", base_url=OLLAMA_URL) if LOCAL
                   else None if model == "fake" else anthropic.Anthropic())
         session = SimpleNamespace(messages=None, observations=[], submit_id=None, step_base=0)
-        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, model, briefing, MAX_COST_USD, session)
+        report, steps, t_in, t_out, cost = _run_loop(conn, client, inv_id, model, briefing, _max_cost(), session)
         model_used = model
         # The fake model never escalates: a free run must stay free.
-        if ESCALATE_MODEL and model != "fake" and report["confidence"] < ESCALATE_BELOW and cost < MAX_COST_USD:
+        if ESCALATE_MODEL and model != "fake" and report["confidence"] < ESCALATE_BELOW and cost < _max_cost():
             log.warning("investigation #%s: confidence %.2f, escalating to %s", inv_id, report["confidence"], ESCALATE_MODEL)
             strong = anthropic.Anthropic()
             session = SimpleNamespace(messages=None, observations=[], submit_id=None, step_base=steps)
-            report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, MAX_COST_USD - cost, session)
+            report, s2, i2, o2, c2 = _run_loop(conn, strong, inv_id, ESCALATE_MODEL, briefing, _max_cost() - cost, session)
             steps, t_in, t_out, cost, model_used = steps + s2, t_in + i2, t_out + o2, cost + c2, f"{model}+{ESCALATE_MODEL}"
             client, model = strong, ESCALATE_MODEL
 
@@ -417,7 +443,7 @@ def _investigate(inv_id: int, model: str, backtest: bool) -> None:
             "INSERT INTO report_cache (exact_key, fingerprint, investigation_id, report, expires_at) "
             "VALUES (%s, %s, %s, %s, now() + make_interval(days => %s)) "
             # Never overwrite an answer a human confirmed.
-            "ON CONFLICT (exact_key) DO UPDATE SET investigation_id = EXCLUDED.investigation_id, report = EXCLUDED.report, "
+            "ON CONFLICT (tenant_id, exact_key) DO UPDATE SET investigation_id = EXCLUDED.investigation_id, report = EXCLUDED.report, "
             "created_at = now(), expires_at = EXCLUDED.expires_at WHERE NOT report_cache.confirmed",
             (briefing.exact_key, briefing.fingerprint, inv_id, json.dumps(report), CACHE_TTL_DAYS),
         )
@@ -439,7 +465,7 @@ def _critique(conn, client, inv_id, model, briefing, session, report, steps, cos
     """Critic, then at most one revision round and one re-critique. Never fails the investigation.
     Returns (report, extra steps, tokens in, tokens out, extra cost)."""
     extra_steps, t_in, t_out, spent = 0, 0, 0, 0.0
-    if cost >= MAX_COST_USD:
+    if cost >= _max_cost():
         return report, 0, 0, 0, 0.0
     try:
         crit, c, i, o = _critic_pass(conn, inv_id, steps, report, session)
@@ -449,7 +475,7 @@ def _critique(conn, client, inv_id, model, briefing, session, report, steps, cos
     spent, t_in, t_out = c, i, o
     final_report, final_crit, rounds, first = report, crit, 1, None
     steps_left = MAX_STEPS - steps
-    budget_left = MAX_COST_USD - cost - spent
+    budget_left = _max_cost() - cost - spent
     if crit["verdict"] == "revise" and steps_left > 0 and budget_left > 0 and session.submit_id:
         # The API needs a tool_result for the submit_report call: the critic's notes go there.
         session.messages.append({"role": "user", "content": [
